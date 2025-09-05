@@ -3,8 +3,10 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { MTLLoader } from "three/examples/jsm/loaders/MTLLoader.js";
-import * as XLSX from "xlsx";
+import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { v4 as uuidv4 } from "uuid";
+import * as XLSX from 'xlsx';
+
 
 // -----------------------------------------------------------------------------
 // Utils
@@ -425,8 +427,21 @@ export default function App3DAnnotations() {
     downloadBlob(JSON.stringify(payload, null, 2), (modelInfo.name || "modelo") + ".anotacoes.json", "application/json");
   }
 
-  // XLSX (Excel)
-  function onExportXLSX() {
+  // XLSX (Excel) — IMPORT DINÂMICO
+  async function onExportXLSX() {
+    if (!annotations.length) {
+      alert("Nenhuma anotação para exportar!");
+      return;
+    }
+
+    // carrega a lib apenas quando precisar
+    const { utils, write, book_new, book_append_sheet } = await import('xlsx').then(mod => ({
+      utils: mod.utils,
+      write: mod.write,
+      book_new: mod.utils.book_new,
+      book_append_sheet: mod.utils.book_append_sheet,
+    }));
+
     const rows = annotations.map((ann, idx) => ({
       "#": idx + 1,
       ID: ann.id,
@@ -441,7 +456,7 @@ export default function App3DAnnotations() {
       "Normal (x,y,z)": Array.isArray(ann.normal) ? ann.normal.map((n) => +n).join(", ") : "",
     }));
 
-    const ws = XLSX.utils.json_to_sheet(rows, {
+    const ws = utils.json_to_sheet(rows, {
       header: ["#", "ID", "Modelo", "Criado em", "Peça", "Tipo", "Severidade", "Status", "Observações", "Posição (x,y,z)", "Normal (x,y,z)"],
     });
 
@@ -450,10 +465,10 @@ export default function App3DAnnotations() {
       { wch: 22 }, { wch: 12 }, { wch: 16 }, { wch: 60 }, { wch: 26 }, { wch: 26 },
     ];
 
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Anotações");
+    const wb = book_new();
+    book_append_sheet(wb, ws, "Anotações");
 
-    const ab = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+    const ab = write(wb, { bookType: "xlsx", type: "array" });
     const blob = new Blob([ab], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const filename = (modelInfo.name || "modelo") + ".anotacoes.xlsx";
     downloadBlob(blob, filename, blob.type);
@@ -645,7 +660,7 @@ export default function App3DAnnotations() {
                 {/* Botão '>>' para minimizar a sidebar */}
                 <button
                   onClick={() => setSidebarCollapsed(true)}
-                  className="ml-1 px-2 py-1 rounded-xl border bg-white text-xs font-semibold hover:bg-gray-50"
+                  className="ml-1 px-2 py-1 rounded-2xl border bg-white text-xs font-semibold hover:bg-gray-50"
                   title="Minimizar painel"
                 >
                   &gt;&gt;
