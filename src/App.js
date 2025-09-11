@@ -1,12 +1,10 @@
-import React, { useEffect, useRef, useState, useMemo } from "react";
+import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { MTLLoader } from "three/examples/jsm/loaders/MTLLoader.js";
-import { GLTFExporter } from "three/examples/jsm/exporters/GLTFExporter.js";
 import { v4 as uuidv4 } from "uuid";
-import * as XLSX from 'xlsx';
-
+import * as XLSX from "xlsx";
 
 // -----------------------------------------------------------------------------
 // Utils
@@ -66,6 +64,13 @@ const DEFAULT_ISSUES = [
   "Outro",
 ];
 
+const STATUS_COLORS = {
+  Aberto: 0xff5555, // Vermelho
+  "Em andamento": 0xffcc66, // Amarelo/Laranja
+  Resolvido: 0x66cc66, // Verde
+  Ignorado: 0x999999, // Cinza
+};
+
 // -----------------------------------------------------------------------------
 // Component
 // -----------------------------------------------------------------------------
@@ -93,14 +98,75 @@ export default function App3DAnnotations() {
   const [loading, setLoading] = useState(false);
   const [isolatedUuid, setIsolatedUuid] = useState(null);
   const [isIsolationMode, setIsIsolationMode] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
+  const [showTutorial, setShowTutorial] = useState(true);
+  const [contextMenu, setContextMenu] = useState(null);
 
-  // NEW: minimizar apenas a sidebar
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-
-  // Sync refs
+  // --- espelhos/refres de estado para usar nos handlers (sem recriar o viewer)
+  const annotationsRef = useRef(annotations);
+  useEffect(() => { annotationsRef.current = annotations; }, [annotations]);
   useEffect(() => { isPlacingRef.current = isPlacing; }, [isPlacing]);
   useEffect(() => { modelGroupRef.current = modelGroup; }, [modelGroup]);
   useEffect(() => { isIsolationModeRef.current = isIsolationMode; }, [isIsolationMode]);
+
+  // Função para colorir peças
+  const colorizePiece = useCallback((object, color) => {
+    if (!object) return;
+    object.traverse((child) => {
+      if (child.isMesh) {
+        if (!child.userData.originalMaterial) {
+          child.userData.originalMaterial = child.material;
+        }
+        const newMaterial = new THREE.MeshStandardMaterial({
+          color,
+          roughness: 0.7,
+          metalness: 0.1,
+        });
+        child.material = newMaterial;
+        child.material.needsUpdate = true;
+      }
+    });
+  }, []);
+
+  // Restaurar cor original
+  const restoreOriginalColor = useCallback((object) => {
+    if (!object) return;
+    object.traverse((child) => {
+      if (child.isMesh && child.userData.originalMaterial) {
+        child.material = child.userData.originalMaterial;
+        child.material.needsUpdate = true;
+      }
+    });
+  }, []);
+
+  // Colorir peça por status (por nome)
+  const colorizePieceByStatus = useCallback(
+    (pieceName, status) => {
+      if (!modelGroupRef.current) return;
+      let targetPiece = null;
+      modelGroupRef.current.traverse((child) => {
+        if (child.name === pieceName && child.isMesh) targetPiece = child;
+      });
+      if (targetPiece) {
+        const color = STATUS_COLORS[status] || 0x0070f3;
+        colorizePiece(targetPiece, color);
+      }
+    },
+    [colorizePiece]
+  );
+
+  // Restaurar cor original por nome
+  const restorePieceColor = useCallback(
+    (pieceName) => {
+      if (!modelGroupRef.current) return;
+      let targetPiece = null;
+      modelGroupRef.current.traverse((child) => {
+        if (child.name === pieceName && child.isMesh) targetPiece = child;
+      });
+      if (targetPiece) restoreOriginalColor(targetPiece);
+    },
+    [restoreOriginalColor]
+  );
 
   // Init viewer (once) - tablet friendly
   useEffect(() => {
@@ -111,7 +177,12 @@ export default function App3DAnnotations() {
     scene.background = new THREE.Color(0xf7f7f8);
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(55, mount.clientWidth / mount.clientHeight, 0.1, 10000);
+    const camera = new THREE.PerspectiveCamera(
+      55,
+      mount.clientWidth / mount.clientHeight,
+      0.1,
+      10000
+    );
     camera.position.set(3, 2, 4);
     cameraRef.current = camera;
 
@@ -164,7 +235,7 @@ export default function App3DAnnotations() {
     const ro = new ResizeObserver(onResize);
     ro.observe(mount);
 
-    // Click for placing pins + isolation
+    // Click para marcar/ isolar
     const onClick = (event) => {
       if (!modelGroupRef.current || !cameraRef.current || !rendererRef.current) return;
       const rect = rendererRef.current.domElement.getBoundingClientRect();
@@ -176,23 +247,34 @@ export default function App3DAnnotations() {
       if (intersects.length === 0) return;
       const hit = intersects[0];
 
-      // Isolar peça somente se o Modo isolamento estiver ativo
       const root = getPieceRoot(hit.object);
+
+      // Isolar peça somente se o Modo isolamento estiver ativo (usa ref)
       if (isIsolationModeRef.current) {
         applyIsolation(root);
       }
 
-      if (!isPlacingRef.current) return; // só cria anotação no modo de marcação
+      // Se não estiver marcando, só isola (se ativo) e sai
+      if (!isPlacingRef.current) return;
 
       const id = uuidv4();
       const normal =
         hit.face && hit.object
-          ? hit.face.normal.clone().applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
+          ? hit.face.normal
+              .clone()
+              .applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
           : new THREE.Vector3(0, 1, 0);
       const pieceName =
         (root && root.name) ||
         ((hit.object.parent && hit.object.parent.name) || hit.object.name) ||
         "";
+
+      // Evita duplicidade por peça (usa ref)
+      if (annotationsRef.current.some((a) => a.objectName === pieceName)) {
+        alert("Já existe uma anotação para esta peça. Edite a anotação existente.");
+        return;
+      }
+
       const ann = {
         id,
         position: [hit.point.x, hit.point.y, hit.point.z],
@@ -207,8 +289,52 @@ export default function App3DAnnotations() {
       addPin(ann);
       setAnnotations((prev) => [ann, ...prev]);
       setSelectedId(id);
+
+      // Colorir a peça com base no status
+      colorizePieceByStatus(pieceName, ann.status);
     };
     renderer.domElement.addEventListener("click", onClick, { passive: true });
+
+    // Context menu (long press)
+    let longPressTimer;
+    const onTouchStart = (event) => {
+      if (event.touches.length !== 1) return;
+      longPressTimer = setTimeout(() => {
+        const rect = renderer.domElement.getBoundingClientRect();
+        const touch = event.touches[0];
+        const mx = (touch.clientX - rect.left) / rect.width;
+        const my = (touch.clientY - rect.top) / rect.height;
+        const mouse = new THREE.Vector2(mx * 2 - 1, -(my * 2 - 1));
+        raycaster.setFromCamera(mouse, cameraRef.current);
+        const intersects = raycaster.intersectObjects(modelGroupRef.current.children, true);
+        if (intersects.length === 0) return;
+
+        const hit = intersects[0];
+        const root = getPieceRoot(hit.object);
+        const pieceName = (root && root.name) || hit.object.name || "";
+
+        // Evitar duplicidade usando ref
+        if (annotationsRef.current.some((a) => a.objectName === pieceName)) {
+          alert("Já existe uma anotação para esta peça. Edite a anotação existente.");
+          return;
+        }
+
+        setContextMenu({
+          x: touch.clientX,
+          y: touch.clientY,
+          pieceName: pieceName,
+          position: [hit.point.x, hit.point.y, hit.point.z],
+        });
+      }, 500);
+    };
+
+    const onTouchEnd = () => {
+      clearTimeout(longPressTimer);
+    };
+
+    renderer.domElement.addEventListener("touchstart", onTouchStart, { passive: true });
+    renderer.domElement.addEventListener("touchend", onTouchEnd, { passive: true });
+    renderer.domElement.addEventListener("touchmove", onTouchEnd, { passive: true });
 
     // Loop
     let rafId;
@@ -222,14 +348,18 @@ export default function App3DAnnotations() {
     return () => {
       cancelAnimationFrame(rafId);
       renderer.domElement.removeEventListener("click", onClick);
+      renderer.domElement.removeEventListener("touchstart", onTouchStart);
+      renderer.domElement.removeEventListener("touchend", onTouchEnd);
+      renderer.domElement.removeEventListener("touchmove", onTouchEnd);
       ro.disconnect();
       controls.dispose();
       renderer.dispose();
-      if (renderer.domElement?.parentElement) renderer.domElement.parentElement.removeChild(renderer.domElement);
+      if (renderer.domElement?.parentElement)
+        renderer.domElement.parentElement.removeChild(renderer.domElement);
     };
-  }, [pinsGroup, raycaster]);
+  }, []); // <-- roda apenas uma vez (monta/desmonta)
 
-  // Load OBJ/MTL
+// Load OBJ/MTL
   async function handleLoadOBJFromFiles(objFile, mtlFile) {
     setLoading(true);
     try {
@@ -271,7 +401,7 @@ export default function App3DAnnotations() {
       // Enquadrar o modelo carregado
       fitCameraToObject(cameraRef.current, group, controlsRef.current, 1.3);
 
-      // Pegar dica do MTL referenciado no OBJ (se houver)
+      // Dica do MTL referenciado no OBJ (se houver)
       const firstMtllib = objText
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -291,9 +421,9 @@ export default function App3DAnnotations() {
     [...pinsGroup.children].forEach((c) => pinsGroup.remove(c));
   }
   function addPin(ann) {
-    const colorBySeverity = { Baixa: 0x66cc66, Média: 0xffcc66, Alta: 0xff9966, Crítica: 0xff5555 };
+    const color = STATUS_COLORS[ann.status] || 0x0070f3;
     const geo = new THREE.SphereGeometry(0.02, 16, 16);
-    const mat = new THREE.MeshStandardMaterial({ color: colorBySeverity[ann.severity] || 0x0070f3 });
+    const mat = new THREE.MeshStandardMaterial({ color: color });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.position.set(ann.position[0], ann.position[1], ann.position[2]);
     mesh.userData.annotationId = ann.id;
@@ -326,16 +456,23 @@ export default function App3DAnnotations() {
     clearIsolation();
     const map = isolationMapRef.current;
     const keep = new Set();
-    targetRoot.traverse((n) => { if (n.isMesh) keep.add(n); });
+    targetRoot.traverse((n) => {
+      if (n.isMesh) keep.add(n);
+    });
     modelGroupRef.current.traverse((n) => {
       if (!n.isMesh) return;
       if (!map.has(n)) map.set(n, { material: n.material, visible: n.visible });
-      if (keep.has(n)) return;
-      const faded = n.material.clone();
-      faded.transparent = true;
-      faded.opacity = 0.1;
-      faded.depthWrite = false;
-      n.material = faded;
+      if (keep.has(n)) {
+        // Destaca a peça selecionada
+        colorizePiece(n, 0x3399ff);
+      } else {
+        // Esmaece as outras
+        const faded = n.material.clone();
+        faded.transparent = true;
+        faded.opacity = 0.1;
+        faded.depthWrite = false;
+        n.material = faded;
+      }
     });
     setIsolatedUuid(targetRoot.uuid);
   }
@@ -344,7 +481,7 @@ export default function App3DAnnotations() {
   function findPieceForAnnotation(ann) {
     if (!modelGroupRef.current || !ann) return null;
 
-    // 1) tenta por nome exato
+    // 1) por nome exato
     if (ann.objectName) {
       let byName = null;
       modelGroupRef.current.traverse((n) => {
@@ -376,8 +513,9 @@ export default function App3DAnnotations() {
       const id = mesh.userData.annotationId;
       const ann = annotations.find((a) => a.id === id);
       if (!ann) return;
-      const colorBySeverity = { Baixa: 0x66cc66, Média: 0xffcc66, Alta: 0xff9966, Crítica: 0xff5555 };
-      mesh.material.color.set(colorBySeverity[ann.severity] || 0x0070f3);
+
+      const color = STATUS_COLORS[ann.status] || 0x0070f3;
+      mesh.material.color.set(color);
       mesh.scale.setScalar(selectedId === id ? 1.6 : 1.0);
     });
   }, [annotations, selectedId, pinsGroup]);
@@ -394,7 +532,12 @@ export default function App3DAnnotations() {
       if (pieceRoot) applyIsolation(pieceRoot);
     }
 
-    // 2) Focar câmera no pin/posição da anotação (sempre)
+    // 2) Colorir a peça de acordo com o status (mesmo sem isolamento)
+    if (ann && ann.objectName) {
+      colorizePieceByStatus(ann.objectName, ann.status);
+    }
+
+    // 3) Focar câmera no pin/posição da anotação (sempre)
     const controls = controlsRef.current;
     const cam = cameraRef.current;
     const dist = cam.position.distanceTo(controls.target);
@@ -402,7 +545,8 @@ export default function App3DAnnotations() {
     let targetPos = null;
     const pin = pinsGroup.children.find((m) => m.userData.annotationId === id);
     if (pin) targetPos = pin.position.clone();
-    else if (ann && ann.position) targetPos = new THREE.Vector3(ann.position[0], ann.position[1], ann.position[2]);
+    else if (ann && ann.position)
+      targetPos = new THREE.Vector3(ann.position[0], ann.position[1], ann.position[2]);
 
     if (targetPos) {
       controls.target.copy(targetPos);
@@ -411,67 +555,145 @@ export default function App3DAnnotations() {
       controls.update();
     }
   }
+
   function onDeleteAnnotation(id) {
+    const ann = annotations.find((a) => a.id === id);
+
+    // Restaurar cor original da peça antes de excluir
+    if (ann && ann.objectName) {
+      restorePieceColor(ann.objectName);
+    }
+
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     const idx = pinsGroup.children.findIndex((m) => m.userData.annotationId === id);
     if (idx >= 0) pinsGroup.remove(pinsGroup.children[idx]);
     if (selectedId === id) setSelectedId(null);
   }
+
   function onUpdateAnnotation(id, patch) {
-    setAnnotations((prev) => prev.map((a) => (a.id === id ? { ...a, ...patch } : a)));
+    setAnnotations((prev) => {
+      const updatedAnnotations = prev.map((a) => (a.id === id ? { ...a, ...patch } : a));
+
+      // Se o status foi alterado, atualize a cor da peça
+      if (patch.status) {
+        const ann = updatedAnnotations.find((a) => a.id === id);
+        if (ann && ann.objectName) {
+          colorizePieceByStatus(ann.objectName, patch.status);
+        }
+      }
+
+      return updatedAnnotations;
+    });
+  }
+
+  function onAddAnnotationFromContextMenu(issueType) {
+    if (!contextMenu) return;
+
+    // Verificar duplicidade usando ref
+    if (annotationsRef.current.some((a) => a.objectName === contextMenu.pieceName)) {
+      alert("Já existe uma anotação para esta peça. Edite a anotação existente.");
+      setContextMenu(null);
+      return;
+    }
+
+    const id = uuidv4();
+    const ann = {
+      id,
+      position: contextMenu.position,
+      normal: [0, 1, 0],
+      objectName: contextMenu.pieceName,
+      issueType: issueType,
+      severity: DEFAULT_SEVERITIES[1],
+      status: DEFAULT_STATUSES[0],
+      note: "",
+      createdAt: new Date().toISOString(),
+    };
+
+    addPin(ann);
+    setAnnotations((prev) => [ann, ...prev]);
+    setSelectedId(id);
+    setContextMenu(null);
+
+    // Colorir a peça com base no status
+    colorizePieceByStatus(contextMenu.pieceName, ann.status);
   }
 
   // Export/Import/Screenshot
   function onExportJSON() {
     const payload = { model: modelInfo.name, exportedAt: new Date().toISOString(), annotations };
-    downloadBlob(JSON.stringify(payload, null, 2), (modelInfo.name || "modelo") + ".anotacoes.json", "application/json");
+    downloadBlob(
+      JSON.stringify(payload, null, 2),
+      (modelInfo.name || "modelo") + ".anotacoes.json",
+      "application/json"
+    );
   }
 
-  // XLSX (Excel) — IMPORT DINÂMICO
   async function onExportXLSX() {
     if (!annotations.length) {
       alert("Nenhuma anotação para exportar!");
       return;
     }
 
-    // carrega a lib apenas quando precisar
-    const { utils, write, book_new, book_append_sheet } = await import('xlsx').then(mod => ({
-      utils: mod.utils,
-      write: mod.write,
-      book_new: mod.utils.book_new,
-      book_append_sheet: mod.utils.book_append_sheet,
-    }));
+    try {
+      const rows = annotations.map((ann, idx) => ({
+        "#": idx + 1,
+        ID: ann.id,
+        Modelo: modelInfo.name || "",
+        "Criado em": new Date(ann.createdAt).toLocaleString(),
+        Peça: ann.objectName || "",
+        Tipo: ann.issueType || "",
+        Severidade: ann.severity || "",
+        Status: ann.status || "",
+        Observações: ann.note || "",
+        "Posição (x,y,z)": Array.isArray(ann.position)
+          ? ann.position.map((n) => +n).join(", ")
+          : "",
+        "Normal (x,y,z)": Array.isArray(ann.normal) ? ann.normal.map((n) => +n).join(", ") : "",
+      }));
 
-    const rows = annotations.map((ann, idx) => ({
-      "#": idx + 1,
-      ID: ann.id,
-      Modelo: modelInfo.name || "",
-      "Criado em": new Date(ann.createdAt).toLocaleString(),
-      Peça: ann.objectName || "",
-      Tipo: ann.issueType || "",
-      Severidade: ann.severity || "",
-      Status: ann.status || "",
-      Observações: ann.note || "",
-      "Posição (x,y,z)": Array.isArray(ann.position) ? ann.position.map((n) => +n).join(", ") : "",
-      "Normal (x,y,z)": Array.isArray(ann.normal) ? ann.normal.map((n) => +n).join(", ") : "",
-    }));
+      const ws = XLSX.utils.json_to_sheet(rows, {
+        header: [
+          "#",
+          "ID",
+          "Modelo",
+          "Criado em",
+          "Peça",
+          "Tipo",
+          "Severidade",
+          "Status",
+          "Observações",
+          "Posição (x,y,z)",
+          "Normal (x,y,z)",
+        ],
+      });
 
-    const ws = utils.json_to_sheet(rows, {
-      header: ["#", "ID", "Modelo", "Criado em", "Peça", "Tipo", "Severidade", "Status", "Observações", "Posição (x,y,z)", "Normal (x,y,z)"],
-    });
+      ws["!cols"] = [
+        { wch: 4 },
+        { wch: 38 },
+        { wch: 28 },
+        { wch: 22 },
+        { wch: 22 },
+        { wch: 22 },
+        { wch: 12 },
+        { wch: 16 },
+        { wch: 60 },
+        { wch: 26 },
+        { wch: 26 },
+      ];
 
-    ws["!cols"] = [
-      { wch: 4 }, { wch: 38 }, { wch: 28 }, { wch: 22 }, { wch: 22 },
-      { wch: 22 }, { wch: 12 }, { wch: 16 }, { wch: 60 }, { wch: 26 }, { wch: 26 },
-    ];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Anotações");
 
-    const wb = book_new();
-    book_append_sheet(wb, ws, "Anotações");
-
-    const ab = write(wb, { bookType: "xlsx", type: "array" });
-    const blob = new Blob([ab], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const filename = (modelInfo.name || "modelo") + ".anotacoes.xlsx";
-    downloadBlob(blob, filename, blob.type);
+      const ab = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([ab], {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      });
+      const filename = (modelInfo.name || "modelo") + ".anotacoes.xlsx";
+      downloadBlob(blob, filename, blob.type);
+    } catch (e) {
+      console.error("Erro ao exportar XLSX:", e);
+      alert("Erro ao exportar para Excel. Verifique o console para mais detalhes.");
+    }
   }
 
   function onImportJSON(file) {
@@ -480,9 +702,25 @@ export default function App3DAnnotations() {
       try {
         const data = JSON.parse(fr.result);
         if (!Array.isArray(data.annotations)) throw new Error("JSON inválido");
+
+        // Restaurar cores das peças antes de importar novas anotações
+        annotations.forEach((ann) => {
+          if (ann.objectName) {
+            restorePieceColor(ann.objectName);
+          }
+        });
+
         setAnnotations(data.annotations);
         clearPins();
         data.annotations.forEach(addPin);
+
+        // Aplicar cores baseadas no status das novas anotações
+        data.annotations.forEach((ann) => {
+          if (ann.objectName) {
+            colorizePieceByStatus(ann.objectName, ann.status);
+          }
+        });
+
         alert("Anotações importadas: " + data.annotations.length);
       } catch (e) {
         alert("Falha ao ler JSON de anotações.");
@@ -494,7 +732,24 @@ export default function App3DAnnotations() {
   function onScreenshot() {
     const renderer = rendererRef.current;
     if (!renderer) return;
-    renderer.domElement.toBlob((blob) => { if (blob) downloadBlob(blob, "screenshot.png", "image/png"); });
+    renderer.domElement.toBlob((blob) => {
+      if (blob) downloadBlob(blob, "screenshot.png", "image/png");
+    });
+  }
+
+  // Navigation between annotations
+  function goToNextAnnotation() {
+    if (annotations.length === 0) return;
+    const currentIndex = annotations.findIndex((a) => a.id === selectedId);
+    const nextIndex = (currentIndex + 1) % annotations.length;
+    onSelectAnnotation(annotations[nextIndex].id);
+  }
+
+  function goToPrevAnnotation() {
+    if (annotations.length === 0) return;
+    const currentIndex = annotations.findIndex((a) => a.id === selectedId);
+    const prevIndex = (currentIndex - 1 + annotations.length) % annotations.length;
+    onSelectAnnotation(annotations[prevIndex].id);
   }
 
   // Persistence by model
@@ -509,12 +764,19 @@ export default function App3DAnnotations() {
           setAnnotations(data);
           clearPins();
           data.forEach(addPin);
+
+          // Aplicar cores baseadas no status
+          data.forEach((ann) => {
+            if (ann.objectName) {
+              colorizePieceByStatus(ann.objectName, ann.status);
+            }
+          });
         }
       } catch {
         // ignore
       }
     }
-  }, [modelInfo.name]);
+  }, [modelInfo.name, colorizePieceByStatus]);
 
   useEffect(() => {
     if (!modelInfo.name) return;
@@ -539,240 +801,327 @@ export default function App3DAnnotations() {
   // ---------------------------------------------------------------------------
   return (
     <div className="w-full h-screen flex flex-col bg-white text-gray-900">
-      {/* App Bar */}
-      <div className="flex items-center gap-2 px-4 py-3 md:py-4 border-b border-gray-200 bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60">
-        <div className="font-semibold text-lg md:text-xl">Gerenciador 3D — Torres de Luz</div>
-        <div className="ml-auto flex items-center gap-2 md:gap-3">
-          {/* Arquivo */}
-          <label className="px-4 py-2 md:px-5 md:py-3 rounded-2xl bg-gray-900 text-white text-sm md:text-base font-semibold active:scale-[.98]">
-            Carregar OBJ/MTL
-            <input
-              type="file"
-              accept=".obj,.mtl"
-              className="hidden"
-              multiple
-              onChange={(e) => handleFilesChosen(e.target.files)}
-            />
-          </label>
+      {/* App Bar Simplificada */}
+      <div className="flex flex-wrap gap-2 p-2 bg-gray-100 border-b border-gray-200">
+        <label className="px-3 py-2 rounded-lg bg-blue-500 text-white font-semibold active:scale-[.98]">
+          📁 Carregar
+          <input
+            type="file"
+            accept=".obj,.mtl"
+            className="hidden"
+            multiple
+            onChange={(e) => handleFilesChosen(e.target.files)}
+          />
+        </label>
 
+        <button
+          onClick={() => setIsPlacing((v) => !v)}
+          className={`px-3 py-2 rounded-lg font-semibold ${
+            isPlacing ? "bg-emerald-600 text-white" : "bg-white border"
+          }`}
+          title="Toque no modelo para marcar"
+        >
+          {isPlacing ? "📍 Marcando…" : "📌 Anotar"}
+        </button>
+
+        <button
+          onClick={() => {
+            setIsIsolationMode((v) => {
+              const next = !v;
+              if (!next) clearIsolation();
+              return next;
+            });
+          }}
+          className={`px-3 py-2 rounded-lg font-semibold ${
+            isIsolationMode ? "bg-purple-600 text-white" : "bg-white border"
+          }`}
+          title="Isolar peças ao clicar"
+        >
+          {isIsolationMode ? "🔍 Isolando" : "🔍 Isolar"}
+        </button>
+
+        <button
+          onClick={() =>
+            modelGroupRef.current &&
+            fitCameraToObject(
+              cameraRef.current,
+              modelGroupRef.current,
+              controlsRef.current,
+              1.25
+            )
+          }
+          className="px-3 py-2 rounded-lg bg-white border font-semibold"
+        >
+          🎯 Enquadrar
+        </button>
+
+        {isolatedUuid && (
           <button
-            onClick={() => modelGroupRef.current && fitCameraToObject(cameraRef.current, modelGroupRef.current, controlsRef.current, 1.25)}
-            className="px-4 py-2 md:px-5 md:py-3 rounded-2xl bg-gray-100 hover:bg-gray-200 text-sm md:text-base font-semibold"
+            onClick={() => clearIsolation()}
+            className="px-3 py-2 rounded-lg bg-white border font-semibold"
           >
-            Enquadrar
+            👁️ Mostrar tudo
           </button>
-
-          <button
-            onClick={() => {
-              setIsIsolationMode((v) => {
-                const next = !v;
-                if (!next) clearIsolation(); // ao desligar o modo, limpa qualquer isolamento
-                return next;
-              });
-            }}
-            className={`px-4 py-2 md:px-5 md:py-3 rounded-2xl text-sm md:text-base font-semibold ${
-              isIsolationMode ? 'bg-indigo-600 text-white' : 'bg-gray-100 hover:bg-gray-200'
-            }`}
-            title="Isolar peças ao clicar/Localizar"
-          >
-            {isIsolationMode ? 'Modo isolamento: ON' : 'Modo isolamento: OFF'}
-          </button>
-
-          <button
-            onClick={() => setIsPlacing((v) => !v)}
-            className={`px-4 py-2 md:px-5 md:py-3 rounded-2xl text-sm md:text-base font-semibold ${isPlacing ? 'bg-emerald-600 text-white' : 'bg-gray-100 hover:bg-gray-200'}`}
-            title="Toque no modelo para marcar"
-          >
-            {isPlacing ? 'Marcando…' : 'Adicionar anotação'}
-          </button>
-
-          {isolatedUuid && (
-            <button
-              onClick={() => clearIsolation()}
-              className="px-4 py-2 md:px-5 md:py-3 rounded-2xl bg-white border text-sm md:text-base font-semibold hover:bg-gray-50"
-            >
-              Sair do isolamento
-            </button>
-          )}
-        </div>
+        )}
       </div>
 
       {/* Sub bar */}
-      <div className="px-4 py-2 text-xs md:text-sm text-gray-600 border-b border-gray-100">
+      <div className="px-3 py-1 text-xs text-gray-600 border-b border-gray-100 bg-gray-50">
         {modelInfo.name ? (
-          <span><span className="font-medium">Modelo:</span> {modelInfo.name} · {humanFileSize(modelInfo.size)}</span>
-        ) : 'Carregue um arquivo .obj (e .mtl) para começar'}
+          <span>
+            <span className="font-medium">Modelo:</span> {modelInfo.name} ·{" "}
+            {humanFileSize(modelInfo.size)}
+          </span>
+        ) : (
+          "Carregue um arquivo .obj (e .mtl) para começar"
+        )}
       </div>
 
       {/* Main content */}
-      <div
-        className={`flex-1 grid grid-cols-1 h-[calc(100vh-112px)]
-        ${sidebarCollapsed
-          ? 'lg:grid-cols-[minmax(0,1fr)_0px]'
-          : 'lg:grid-cols-[minmax(0,1fr)_420px]'}`
-        }
-      >
-        {/* Viewer */}
-        <div className="relative">
-          <div ref={mountRef} className="absolute inset-0" />
+      <div className="flex-1 relative">
+        <div ref={mountRef} className="absolute inset-0" />
 
-          {/* Dica de gestos */}
-          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 bg-white/80 backdrop-blur rounded-2xl shadow px-3 py-2 text-[11px] md:text-xs text-gray-700">
-            Gesto: 1 dedo gira · 2 dedos move/zoom
-          </div>
-
-          {/* FABs */}
-          <div className="absolute bottom-4 right-4 flex flex-col gap-3">
-            <button
-              onClick={() => modelGroupRef.current && fitCameraToObject(cameraRef.current, modelGroupRef.current, controlsRef.current, 1.25)}
-              className="min-w-[48px] h-12 md:h-14 px-4 rounded-2xl shadow bg-gray-900 text-white text-sm md:text-base font-semibold active:scale-[.98]"
-            >
-              Fit
-            </button>
-            {isolatedUuid && (
-              <button
-                onClick={clearIsolation}
-                className="min-w-[48px] h-12 md:h-14 px-4 rounded-2xl shadow bg-white border text-sm md:text-base font-semibold active:scale-[.98]"
-              >
-                Mostrar tudo
-              </button>
-            )}
-            <button onClick={onScreenshot} className="min-w-[48px] h-12 md:h-14 px-4 rounded-2xl shadow bg-white border text-sm md:text-base font-semibold active:scale-[.98]">Screenshot</button>
-          </div>
-
-          {loading && (
-            <div className="absolute inset-0 grid place-items-center bg-white/60 z-30">
-              <div className="animate-pulse text-sm bg-white rounded-2xl px-4 py-3 shadow border">Carregando modelo…</div>
-            </div>
-          )}
+        {/* Dica de gestos */}
+        <div className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 bg-white/80 backdrop-blur rounded-xl shadow px-3 py-1 text-xs text-gray-700">
+          1 dedo gira · 2 dedos move/zoom
         </div>
 
-        {/* Side panel */}
-        {!sidebarCollapsed && (
-          <div className="border-t lg:border-t-0 lg:border-l border-gray-200 bg-gray-50 h-full flex flex-col min-h-0">
-            <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-              <div className="flex items-start gap-3">
-                <div>
-                  <div className="text-lg font-semibold">Anotações</div>
-                  <div className="text-xs text-gray-600">Marque não conformidades e gere relatórios</div>
-                </div>
+        {/* FABs */}
+        <div className="absolute bottom-3 right-3 flex flex-col gap-2">
+          <button
+            onClick={() =>
+              modelGroupRef.current &&
+              fitCameraToObject(
+                cameraRef.current,
+                modelGroupRef.current,
+                controlsRef.current,
+                1.25
+              )
+            }
+            className="w-12 h-12 rounded-full shadow bg-gray-900 text-white font-semibold grid place-items-center"
+          >
+            🎯
+          </button>
 
-                {/* Botão '>>' para minimizar a sidebar */}
+          {annotations.length > 0 && (
+            <>
+              <button
+                onClick={goToPrevAnnotation}
+                className="w-12 h-12 rounded-full shadow bg-white border font-semibold grid place-items-center"
+              >
+                ◀
+              </button>
+              <button
+                onClick={goToNextAnnotation}
+                className="w-12 h-12 rounded-full shadow bg-white border font-semibold grid place-items-center"
+              >
+                ▶
+              </button>
+            </>
+          )}
+
+          <button
+            onClick={onScreenshot}
+            className="w-12 h-12 rounded-full shadow bg-white border font-semibold grid place-items-center"
+          >
+            📸
+          </button>
+
+          <button
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            className="w-12 h-12 rounded-full shadow bg-white border font-semibold grid place-items-center"
+          >
+            {sidebarCollapsed ? "📋" : "✕"}
+          </button>
+        </div>
+
+        {loading && (
+          <div className="absolute inset-0 grid place-items-center bg-white/60 z-30">
+            <div className="animate-pulse text-sm bg-white rounded-xl px-4 py-3 shadow border">
+              Carregando modelo…
+            </div>
+          </div>
+        )}
+
+        {/* Tutorial Inicial */}
+        {showTutorial && (
+          <div className="absolute inset-0 bg-black/70 flex items-center justify-center z-40 p-4">
+            <div className="bg-white rounded-2xl p-5 max-w-md">
+              <h2 className="text-xl font-bold mb-3">Bem-vindo ao Visualizador 3D!</h2>
+              <ul className="list-disc pl-5 mb-4 space-y-2">
+                <li>
+                  Toque com <b>um dedo</b> para rotacionar a vista
+                </li>
+                <li>
+                  Toque com <b>dois dedos</b> para mover e dar zoom
+                </li>
+                <li>
+                  Use o botão <b>Anotar</b> e <b>Isolar</b> e toque no modelo para marcar problemas
+                </li>
+                <li>Toque longo em uma peça para menu rápido de anotações</li>
+                <li>
+                  Cada peça pode ter apenas <b>uma anotação</b>
+                </li>
+              </ul>
+              <button
+                onClick={() => setShowTutorial(false)}
+                className="w-full py-2 bg-blue-500 text-white rounded-lg font-semibold"
+              >
+                Entendi, vamos começar!
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Menu de Contexto (toque longo) */}
+        {contextMenu && (
+          <div 
+            className="absolute z-30 bg-white rounded-xl shadow-lg border p-3"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <div className="text-xs text-gray-500 mb-2">Adicionar à: {contextMenu.pieceName}</div>
+            <div className="grid grid-cols-2 gap-2">
+              {DEFAULT_ISSUES.slice(0, 4).map(issue => (
                 <button
-                  onClick={() => setSidebarCollapsed(true)}
-                  className="ml-1 px-2 py-1 rounded-2xl border bg-white text-xs font-semibold hover:bg-gray-50"
-                  title="Minimizar painel"
+                  key={issue}
+                  onClick={() => onAddAnnotationFromContextMenu(issue)}
+                  className="px-3 py-2 text-xs bg-gray-100 rounded-lg hover:bg-gray-200"
                 >
-                  &gt;&gt;
+                  {issue}
                 </button>
-              </div>
-
-              <div className="flex gap-2">
-                <button onClick={onExportJSON} className="px-3 py-2 rounded-2xl text-sm font-semibold bg-gray-900 text-white hover:bg-black">
-                  Exportar JSON
-                </button>
-                <button onClick={onExportXLSX} className="px-3 py-2 rounded-2xl text-sm font-semibold bg-white border hover:bg-gray-50">
-                  Exportar XLSX
-                </button>
-              </div>
-            </div>
-
-            {mtlHint && (
-              <div className="mx-4 mt-3 mb-0 text-[12px] bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl p-3">
-                O OBJ referencia um material: <span className="font-mono">{mtlHint}</span>. Para cores/texturas completas, adicione o arquivo .mtl.
-              </div>
-            )}
-
-            <div className="p-4">
-              <label className="block text-xs font-medium text-gray-700 mb-1">Importar anotações (JSON)</label>
-              <input
-                type="file"
-                accept="application/json"
-                onChange={(e) => e.target.files?.[0] && onImportJSON(e.target.files[0])}
-                className="block text-sm"
-              />
-            </div>
-
-            <div className="px-4 pb-3 text-xs text-gray-600">{annotations.length} anotação(ões)</div>
-
-            <div className="flex-1 overflow-y-auto px-4 pb-6 space-y-3 min-h-0">
-              {annotations.map((ann) => (
-                <div key={ann.id} className={`rounded-2xl border ${selectedId === ann.id ? "border-gray-900" : "border-gray-200"} bg-white shadow-sm p-3`}>
-                  <div className="flex items-center justify-between gap-2">
-                    <button onClick={() => onSelectAnnotation(ann.id)} className="text-left">
-                      <div className="text-sm font-semibold">{ann.issueType}</div>
-                      <div className="text-[11px] text-gray-600">{new Date(ann.createdAt).toLocaleString()}</div>
-                    </button>
-                    <div className="flex items-center gap-2">
-                      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-gray-100">
-                        <span
-                          className="w-2 h-2 rounded-full"
-                          style={{ backgroundColor: ann.severity === "Crítica" ? "#ff5555" : ann.severity === "Alta" ? "#ff9966" : ann.severity === "Média" ? "#ffcc66" : "#66cc66" }}
-                        />
-                        {ann.severity}
-                      </span>
-                      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-full bg-gray-100">{ann.status}</span>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 mt-2">
-                    <div>
-                      <label className="block text-[11px] text-gray-600">Tipo</label>
-                      <select value={ann.issueType} onChange={(e) => onUpdateAnnotation(ann.id, { issueType: e.target.value })} className="mt-1 w-full rounded-2xl border-gray-300 text-sm">
-                        {DEFAULT_ISSUES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] text-gray-600">Severidade</label>
-                      <select value={ann.severity} onChange={(e) => onUpdateAnnotation(ann.id, { severity: e.target.value })} className="mt-1 w-full rounded-2xl border-gray-300 text-sm">
-                        {DEFAULT_SEVERITIES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] text-gray-600">Status</label>
-                      <select value={ann.status} onChange={(e) => onUpdateAnnotation(ann.id, { status: e.target.value })} className="mt-1 w-full rounded-2xl border-gray-300 text-sm">
-                        {DEFAULT_STATUSES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-[11px] text-gray-600">Peça</label>
-                      <input value={ann.objectName || ""} onChange={(e) => onUpdateAnnotation(ann.id, { objectName: e.target.value })} className="mt-1 w-full rounded-2xl border-gray-300 text-sm px-3 py-2" placeholder="Ex: Braço, Base, Travessa" />
-                    </div>
-                    <div className="col-span-2">
-                      <label className="block text-[11px] text-gray-600">Observações</label>
-                      <textarea value={ann.note} onChange={(e) => onUpdateAnnotation(ann.id, { note: e.target.value })} className="mt-1 w-full rounded-2xl border-gray-300 text-sm px-3 py-2" rows={3} placeholder="Descreva o problema, medições, etc." />
-                    </div>
-                    <div className="col-span-2 flex items-center justify-between">
-                      <button onClick={() => onSelectAnnotation(ann.id)} className="px-3 py-2 rounded-2xl text-sm font-semibold bg-gray-100 hover:bg-gray-200">Localizar no modelo</button>
-                      <button onClick={() => onDeleteAnnotation(ann.id)} className="px-3 py-2 rounded-2xl text-sm font-semibold bg-red-50 text-red-600 hover:bg-red-100">Excluir</button>
-                    </div>
-                  </div>
-                </div>
               ))}
-
-              {annotations.length === 0 && (
-                <div className="text-sm text-gray-600 bg-white border border-dashed border-gray-300 rounded-2xl p-4">
-                  Nenhuma anotação ainda. Ative <span className="font-semibold">Adicionar anotação</span> e toque no modelo para marcar.
-                </div>
-              )}
             </div>
-
-            <div className="p-3 text-[11px] text-gray-500 border-t">
-              Dica: 1 dedo gira · 2 dedos move/zoom. O isolamento ativa ao tocar em uma peça; use "Sair do isolamento" para retornar.
-            </div>
+            <button 
+              onClick={() => setContextMenu(null)}
+              className="w-full mt-2 py-1 text-xs text-gray-500 hover:text-gray-700"
+            >
+              Cancelar
+            </button>
           </div>
         )}
       </div>
 
-      {/* Botão flutuante para reabrir a sidebar quando minimizada */}
-      {sidebarCollapsed && (
-        <button
-          onClick={() => setSidebarCollapsed(false)}
-          className="hidden lg:flex fixed right-3 top-20 z-40 px-3 py-2 rounded-2xl border bg-white shadow text-sm font-semibold hover:bg-gray-50"
-          title="Mostrar painel de anotações"
-        >
-          &lt;&lt;
-        </button>
+      {/* Side Panel (lateral direita) */}
+      {!sidebarCollapsed && (
+        <div className="absolute right-0 top-0 bottom-0 w-full max-w-md bg-white border-l border-gray-200 shadow-lg z-20 flex flex-col">
+          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+            <div>
+              <div className="text-lg font-semibold">Anotações</div>
+              <div className="text-xs text-gray-600">{annotations.length} anotação(ões)</div>
+            </div>
+            
+            <div className="flex gap-2">
+              <button onClick={onExportJSON} className="px-3 py-2 rounded-lg text-sm font-semibold bg-gray-900 text-white">
+                JSON
+              </button>
+              <button onClick={onExportXLSX} className="px-3 py-2 rounded-lg text-sm font-semibold bg-green-600 text-white">
+                Excel
+              </button>
+              <button 
+                onClick={() => setSidebarCollapsed(true)}
+                className="w-10 h-10 rounded-lg grid place-items-center border"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          {mtlHint && (
+            <div className="mx-4 mt-3 mb-0 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-xl p-3">
+              O OBJ referencia: <span className="font-mono">{mtlHint}</span>. Para cores/texturas, adicione o arquivo .mtl.
+            </div>
+          )}
+
+          <div className="p-4 border-b">
+            <label className="block text-xs font-medium text-gray-700 mb-1">Importar anotações (JSON)</label>
+            <input
+              type="file"
+              accept="application/json"
+              onChange={(e) => e.target.files?.[0] && onImportJSON(e.target.files[0])}
+              className="block text-sm w-full p-2 border rounded-lg"
+            />
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {annotations.map((ann) => (
+              <div key={ann.id} className={`rounded-xl border ${selectedId === ann.id ? "border-blue-500" : "border-gray-200"} bg-white p-3`}>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <button onClick={() => onSelectAnnotation(ann.id)} className="text-left flex-1">
+                    <div className="text-sm font-semibold">{ann.issueType}</div>
+                    <div className="text-xs text-gray-600">{new Date(ann.createdAt).toLocaleString()}</div>
+                  </button>
+                  <div className="flex items-center gap-1">
+                    <span className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-gray-100">
+                      <span
+                        className="w-2 h-2 rounded-full"
+                        style={{ backgroundColor: `#${STATUS_COLORS[ann.status].toString(16).padStart(6, '0')}` }}
+                      />
+                      {ann.status}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-gray-600">Tipo</label>
+                    <select value={ann.issueType} onChange={(e) => onUpdateAnnotation(ann.id, { issueType: e.target.value })} className="mt-1 w-full rounded-lg border-gray-300 text-xs p-2">
+                      {DEFAULT_ISSUES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600">Severidade</label>
+                    <select value={ann.severity} onChange={(e) => onUpdateAnnotation(ann.id, { severity: e.target.value })} className="mt-1 w-full rounded-lg border-gray-300 text-xs p-2">
+                      {DEFAULT_SEVERITIES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600">Status</label>
+                    <select value={ann.status} onChange={(e) => onUpdateAnnotation(ann.id, { status: e.target.value })} className="mt-1 w-full rounded-lg border-gray-300 text-xs p-2">
+                      {DEFAULT_STATUSES.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600">Peça</label>
+                    <input value={ann.objectName || ""} onChange={(e) => onUpdateAnnotation(ann.id, { objectName: e.target.value })} className="mt-1 w-full rounded-lg border-gray-300 text-xs p-2" placeholder="Ex: Braço, Base, Travessa" />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="block text-xs text-gray-600">Observações</label>
+                    <textarea value={ann.note} onChange={(e) => onUpdateAnnotation(ann.id, { note: e.target.value })} className="mt-1 w-full rounded-lg border-gray-300 text-xs p-2" rows={2} placeholder="Descreva o problema..." />
+                  </div>
+                  <div className="col-span-2 flex items-center justify-between mt-2">
+                    <button onClick={() => onSelectAnnotation(ann.id)} className="px-3 py-2 rounded-lg text-xs font-semibold bg-gray-100">Localizar</button>
+                    <button onClick={() => onDeleteAnnotation(ann.id)} className="px-3 py-2 rounded-lg text-xs font-semibold bg-red-50 text-red-600">Excluir</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+
+            {annotations.length === 0 && (
+              <div className="text-sm text-gray-600 bg-gray-50 border border-dashed border-gray-300 rounded-xl p-4 text-center">
+                Nenhuma anotação ainda. Ative <span className="font-semibold">Anotar</span> e toque no modelo para marcar.
+              </div>
+            )}
+          </div>
+
+          {/* Legenda de Status */}
+          <div className="p-3 border-t mt-auto">
+            <div className="text-xs font-medium mb-2">Legenda de Status:</div>
+            <div className="grid grid-cols-2 gap-2">
+              {DEFAULT_STATUSES.map(status => (
+                <div key={status} className="flex items-center gap-2">
+                  <div 
+                    className="w-3 h-3 rounded-full" 
+                    style={{ 
+                      backgroundColor: `#${STATUS_COLORS[status].toString(16).padStart(6, '0')}`,
+                      border: STATUS_COLORS[status] === 0xffffff ? "1px solid #ccc" : "none"
+                    }}
+                  />
+                  <span className="text-xs">{status}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
