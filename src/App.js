@@ -1106,7 +1106,7 @@ export default function App3DAnnotations() {
           </div>
         </div>
       </div>
-          {/* Importante: tutorial opcional */}
+
       {/* Importante: tutorial opcional */}
       {showTutorial && (
         <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-40 p-6">
