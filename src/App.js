@@ -1,4 +1,3 @@
-// App3DAnnotations.jsx
 import React, { useEffect, useRef, useState, useMemo, useCallback } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
@@ -8,19 +7,31 @@ import { v4 as uuidv4 } from "uuid";
 import * as XLSX from "xlsx";
 import { createClient } from "@supabase/supabase-js";
 
-/* =========================
-   Supabase (preencha os seus)
-   ========================= */
+/* ===========================
+   Supabase
+=========================== */
 const SUPABASE_URL = "https://hkhqoxigwkuhrccwaght.supabase.co";
 const SUPABASE_ANON_KEY =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhraHFveGlnd2t1aHJjY3dhZ2h0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2MTg1NzQsImV4cCI6MjA3MzE5NDU3NH0.mJJGbu2BrR6aLlov2yjbGnBjWJVKeGHtdXGwK_e9M7A";
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-/* =========================
-   Config / Constantes
-   ========================= */
-const ENGE_JSON_PATH = "/dados_engeviewer_completo.json"; // coloque em public/
-const ENGE_GLOBAL_KEY = "__enge_index_cache__";
+/* ===========================
+   Tema (paleta)
+=========================== */
+const THEME = {
+  bgApp: "#0f1720",
+  primary: "#26405d",
+  action1: "#00a49a", // Anotar / confirmar
+  action2: "#b85236", // Isolar
+  action3: "#c35e1e", // Exportar
+  text: "#e5eef7",
+  textDim: "#a9b8c7",
+  border: "#1f3144",
+};
+
+/* Alturas fixas para layout (evita sobreposição) */
+const HEADER_H = 72;
+const SUBBAR_H = 40;
 
 const DEFAULT_SEVERITIES = ["Baixa", "Média", "Alta", "Crítica"];
 const DEFAULT_STATUSES = ["Aberto", "Em andamento", "Resolvido", "Ignorado"];
@@ -39,23 +50,7 @@ const STATUS_COLORS = {
   Ignorado: 0x999999,
 };
 
-/* =========================
-   Utils
-   ========================= */
-const norm = (v) => (v == null ? "" : String(v).trim());
-
-function humanFileSize(bytes) {
-  const thresh = 1024;
-  if (Math.abs(bytes) < thresh) return bytes + " B";
-  const units = ["KB", "MB", "GB", "TB"];
-  let u = -1;
-  do {
-    bytes /= thresh;
-    ++u;
-  } while (Math.abs(bytes) >= thresh && u < units.length - 1);
-  return bytes.toFixed(1) + " " + units[u];
-}
-
+/* Utils */
 function downloadBlob(data, filename, mimeType) {
   const blob = data instanceof Blob ? data : new Blob([data], { type: mimeType });
   const url = URL.createObjectURL(blob);
@@ -67,228 +62,157 @@ function downloadBlob(data, filename, mimeType) {
   a.remove();
   URL.revokeObjectURL(url);
 }
-
-// torna persistível sem fotos base64 pesadas
+function fitCameraToObject(camera, object, controls, offset = 1.25) {
+  const box = new THREE.Box3().setFromObject(object);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxSize = Math.max(size.x, size.y, size.z);
+  const fitHeightDistance = maxSize / (2 * Math.tan((Math.PI * camera.fov) / 360));
+  const fitWidthDistance = fitHeightDistance / camera.aspect;
+  const distance = offset * Math.max(fitHeightDistance, fitWidthDistance);
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  controls.target.copy(center);
+  camera.near = Math.max(0.1, distance / 100);
+  camera.far = distance * 100;
+  camera.updateProjectionMatrix();
+  camera.position.copy(center.clone().add(dir.multiplyScalar(distance)));
+  controls.update();
+}
+function humanFileSize(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = bytes;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+}
 const makePersistableAnnotations = (anns) =>
   (anns || []).map((a) => ({
     ...a,
-    photos: (a.photos || []).map((p) => ({
-      id: p.id,
-      name: p.name,
-      url: p.url,
-      createdAt: p.createdAt,
-    })),
+    photos: (a.photos || []).map((p) => ({ id: p.id, name: p.name, url: p.url, createdAt: p.createdAt })),
   }));
-
 function persistAnnotations(key, anns) {
   try {
     localStorage.setItem(key, JSON.stringify(makePersistableAnnotations(anns)));
-  } catch (_) {
-    try {
-      localStorage.setItem(key, JSON.stringify(makePersistableAnnotations(anns.slice(0, 50))));
-    } catch {}
-  }
+  } catch {}
 }
-
 function readPersistedAnnotations(key) {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (Array.isArray(data)) return data;
-    if (data && Array.isArray(data.annotations)) return data.annotations;
+    const d = JSON.parse(raw);
+    if (Array.isArray(d)) return d;
+    if (d?.annotations) return d.annotations;
     return null;
   } catch {
     return null;
   }
 }
-
-/* =========================
-   Índice ENGE (carrega 1x)
-   ========================= */
-const pickMeta = (row) => ({
-  type: row?.type ?? "",
-  component: row?.component ?? "",
-  profile: row?.profile ?? "",
-  position: row?.position ?? "",
-  handle: row?.handle ?? "",
-  quadrant: row?.quadrant ?? "",
-  lt_id: row?.lt_id ?? "",
-  tower_id: row?.tower_id ?? "",
-});
-
-function extractKey(row) {
-  return (
-    row?.upld ??
-    row?.upId ??
-    row?.UPLD ??
-    row?.UPID ??
-    row?.upid ??
-    row?.uplId ??
-    null
-  );
-}
-
-async function loadEngeIndexOnce() {
-  if (window[ENGE_GLOBAL_KEY]) return window[ENGE_GLOBAL_KEY];
-
-  const res = await fetch(ENGE_JSON_PATH, { cache: "force-cache" });
-  if (!res.ok) throw new Error("Falha ao carregar dados_engeviewer_completo.json");
-  const data = await res.json();
-
-  const index = new Map();
-  const components = new Set();
-
-  if (Array.isArray(data)) {
-    for (const row of data) {
-      const k = extractKey(row);
-      if (!k) continue;
-      const key = norm(k);
-      if (!index.has(key)) index.set(key, pickMeta(row));
-      if (row?.component) components.add(String(row.component));
-    }
-  }
-
-  const payload = { index, components: [...components].sort((a, b) => a.localeCompare(b)) };
-  window[ENGE_GLOBAL_KEY] = payload;
-  return payload;
-}
-
-/* =========================
-   Upload de foto → Supabase
-   ========================= */
 async function uploadPhoto(file, pieceId) {
-  const safeName = file.name?.replace(/\s+/g, "_") || "photo.jpg";
-  const path = `${pieceId}/${Date.now()}-${safeName}`;
+  const safe = (file.name || "foto.jpg").replace(/\s+/g, "_");
+  const path = `${pieceId}/${Date.now()}-${safe}`;
   const { error } = await supabase.storage.from("photos").upload(path, file, { upsert: false });
   if (error) throw error;
   const { data: pub } = supabase.storage.from("photos").getPublicUrl(path);
   return pub?.publicUrl;
 }
 
-/* =====================================================
-   Componente principal
-   ===================================================== */
+/* ===========================
+   Componente
+=========================== */
 export default function App3DAnnotations() {
-  // viewer
   const mountRef = useRef(null);
   const rendererRef = useRef(null);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
   const controlsRef = useRef(null);
+  const modelGroupRef = useRef(null);
+  const isolationMapRef = useRef(new Map());
+  const isPlacingRef = useRef(false);
+  const isIsolationModeRef = useRef(false);
   const raycaster = useMemo(() => new THREE.Raycaster(), []);
 
-  // estados
   const [modelInfo, setModelInfo] = useState({ name: "", size: 0 });
   const [modelGroup, setModelGroup] = useState(null);
   const [pinsGroup] = useState(() => new THREE.Group());
   const [annotations, setAnnotations] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [isPlacing, setIsPlacing] = useState(false);
-  const [isIsolationMode, setIsIsolationMode] = useState(false);
+  const [isolationMode, setIsolationMode] = useState(false);
   const [isolatedUuid, setIsolatedUuid] = useState(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [loading, setLoading] = useState(false);
   const [mtlHint, setMtlHint] = useState(null);
-  const [showTutorial, setShowTutorial] = useState(false);
-  const [contextMenu, setContextMenu] = useState(null);
-
-  // índice ENGE (mapeamento upld -> meta) e filtro
-  const [engeIndex, setEngeIndex] = useState(null); // Map
-  const [componentOptions, setComponentOptions] = useState([]); // string[]
-  const [componentFilter, setComponentFilter] = useState("");
-
-  // photo viewer
   const [photoViewer, setPhotoViewer] = useState({ open: false, url: "", name: "" });
 
-  // refs vivas
-  const isPlacingRef = useRef(false);
-  const modelGroupRef = useRef(null);
-  const isIsolationModeRef = useRef(false);
   const annotationsRef = useRef(annotations);
-  useEffect(() => (isPlacingRef.current = isPlacing), [isPlacing]);
-  useEffect(() => (modelGroupRef.current = modelGroup), [modelGroup]);
-  useEffect(() => (isIsolationModeRef.current = isIsolationMode), [isIsolationMode]);
-  useEffect(() => (annotationsRef.current = annotations), [annotations]);
-
-  /* ----- carregar índice ENGE apenas 1x ----- */
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        const { index, components } = await loadEngeIndexOnce();
-        if (!alive) return;
-        setEngeIndex(index);
-        setComponentOptions(components);
-      } catch (e) {
-        console.error("Erro carregando índice Engeviewer:", e);
-      }
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
+    annotationsRef.current = annotations;
+  }, [annotations]);
+  useEffect(() => {
+    isPlacingRef.current = isPlacing;
+  }, [isPlacing]);
+  useEffect(() => {
+    isIsolationModeRef.current = isolationMode;
+  }, [isolationMode]);
+  useEffect(() => {
+    modelGroupRef.current = modelGroup;
+  }, [modelGroup]);
 
-  /* ----- helpers 3D / cores ----- */
-  const colorizePiece = useCallback((object, color) => {
-    if (!object) return;
-    object.traverse((child) => {
-      if (child.isMesh) {
-        if (!child.userData.originalMaterial) child.userData.originalMaterial = child.material;
-        child.material = new THREE.MeshStandardMaterial({
-          color,
-          roughness: 0.7,
-          metalness: 0.1,
-        });
-        child.material.needsUpdate = true;
+  /* Cores peça */
+  const colorizePiece = useCallback((obj, color) => {
+    if (!obj) return;
+    obj.traverse((ch) => {
+      if (ch.isMesh) {
+        if (!ch.userData.originalMaterial) ch.userData.originalMaterial = ch.material;
+        ch.material = new THREE.MeshStandardMaterial({ color, roughness: 0.7, metalness: 0.1 });
+        ch.material.needsUpdate = true;
       }
     });
   }, []);
-
-  const restoreOriginalColor = useCallback((object) => {
-    if (!object) return;
-    object.traverse((child) => {
-      if (child.isMesh && child.userData.originalMaterial) {
-        child.material = child.userData.originalMaterial;
-        child.material.needsUpdate = true;
+  const restoreOriginalColor = useCallback((obj) => {
+    if (!obj) return;
+    obj.traverse((ch) => {
+      if (ch.isMesh && ch.userData.originalMaterial) {
+        ch.material = ch.userData.originalMaterial;
+        ch.material.needsUpdate = true;
       }
     });
   }, []);
-
   const colorizePieceByStatus = useCallback(
     (pieceName, status) => {
-      if (!modelGroupRef.current) return;
-      let targetPiece = null;
-      modelGroupRef.current.traverse((child) => {
-        if (child.name === pieceName && child.isMesh) targetPiece = child;
+      const root = modelGroupRef.current;
+      if (!root) return;
+      let t = null;
+      root.traverse((ch) => {
+        if (ch.isMesh && ch.name === pieceName) t = ch;
       });
-      if (targetPiece) {
-        const color = STATUS_COLORS[status] || 0x0070f3;
-        colorizePiece(targetPiece, color);
-      }
+      if (t) colorizePiece(t, STATUS_COLORS[status] || 0x0070f3);
     },
     [colorizePiece]
   );
-
   const restorePieceColor = useCallback(
     (pieceName) => {
-      if (!modelGroupRef.current) return;
-      let targetPiece = null;
-      modelGroupRef.current.traverse((child) => {
-        if (child.name === pieceName && child.isMesh) targetPiece = child;
+      const root = modelGroupRef.current;
+      if (!root) return;
+      let t = null;
+      root.traverse((ch) => {
+        if (ch.isMesh && ch.name === pieceName) t = ch;
       });
-      if (targetPiece) restoreOriginalColor(targetPiece);
+      if (t) restoreOriginalColor(t);
     },
     [restoreOriginalColor]
   );
 
-  /* ----- viewer init (sem sombra dura) ----- */
+  /* Viewer THREE – sem sombras */
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0f14);
+    scene.background = new THREE.Color("#0b1220");
     sceneRef.current = scene;
 
     const camera = new THREE.PerspectiveCamera(55, mount.clientWidth / mount.clientHeight, 0.1, 10000);
@@ -299,18 +223,17 @@ export default function App3DAnnotations() {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(mount.clientWidth, mount.clientHeight);
-    renderer.domElement.style.touchAction = "none";
+    renderer.shadowMap.enabled = false; // <<< sem sombras
     mount.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x334455, 0.9);
-    scene.add(hemi);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.9));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.6);
     dir.position.set(5, 10, 7);
     scene.add(dir);
 
-    const grid = new THREE.GridHelper(20, 20, 0x233344, 0x1a2a38);
-    grid.material.opacity = 0.25;
+    const grid = new THREE.GridHelper(20, 20, 0x233647, 0x1b2a38);
+    grid.material.opacity = 0.35;
     grid.material.transparent = true;
     scene.add(grid);
 
@@ -321,93 +244,51 @@ export default function App3DAnnotations() {
     controls.enableDamping = true;
     controls.dampingFactor = 0.07;
     controls.rotateSpeed = 0.7;
-    controls.panSpeed = 0.9;
     controls.zoomSpeed = 0.9;
+    controls.panSpeed = 0.9;
+    controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
     controlsRef.current = controls;
 
     const onResize = () => {
-      requestAnimationFrame(() => {
-        if (!mount || !cameraRef.current || !rendererRef.current) return;
-        const w = mount.clientWidth;
-        const h = mount.clientHeight;
-        rendererRef.current.setSize(w, h);
-        cameraRef.current.aspect = w / h;
-        cameraRef.current.updateProjectionMatrix();
-      });
+      if (!rendererRef.current || !cameraRef.current) return;
+      const w = mount.clientWidth,
+        h = mount.clientHeight;
+      rendererRef.current.setSize(w, h);
+      cameraRef.current.aspect = w / h;
+      cameraRef.current.updateProjectionMatrix();
     };
-    const ro = new ResizeObserver(onResize);
+    const ro = new ResizeObserver(() => requestAnimationFrame(onResize));
     ro.observe(mount);
 
-    const getPieceRoot = (obj) => {
-      let cur = obj;
-      const root = modelGroupRef.current;
-      while (cur && cur.parent && cur.parent !== root) cur = cur.parent;
-      return cur || obj;
-    };
-    const applyIsolation = (targetRoot) => {
+    const onClick = (ev) => {
       if (!modelGroupRef.current) return;
-      const keep = new Set();
-      targetRoot.traverse((n) => n.isMesh && keep.add(n));
-      modelGroupRef.current.traverse((n) => {
-        if (!n.isMesh) return;
-        if (keep.has(n)) colorizePiece(n, 0x3399ff);
-        else {
-          const faded = n.material.clone();
-          faded.transparent = true;
-          faded.opacity = 0.1;
-          faded.depthWrite = false;
-          n.material = faded;
-        }
-      });
-      setIsolatedUuid(targetRoot.uuid);
-    };
-
-    const onClick = (event) => {
-      if (!modelGroupRef.current || !cameraRef.current || !rendererRef.current) return;
-      const rect = rendererRef.current.domElement.getBoundingClientRect();
-      const mx = (event.clientX - rect.left) / rect.width;
-      const my = (event.clientY - rect.top) / rect.height;
+      const rect = renderer.domElement.getBoundingClientRect();
+      const mx = (ev.clientX - rect.left) / rect.width,
+        my = (ev.clientY - rect.top) / rect.height;
       const mouse = new THREE.Vector2(mx * 2 - 1, -(my * 2 - 1));
       raycaster.setFromCamera(mouse, cameraRef.current);
-      const intersects = raycaster.intersectObjects(modelGroupRef.current.children, true);
-      if (intersects.length === 0) return;
-      const hit = intersects[0];
-
+      const hit = raycaster.intersectObjects(modelGroupRef.current.children, true)[0];
+      if (!hit) return;
       const root = getPieceRoot(hit.object);
       if (isIsolationModeRef.current) applyIsolation(root);
       if (!isPlacingRef.current) return;
 
-      const id = uuidv4();
       const normal =
         hit.face && hit.object
           ? hit.face.normal.clone().applyMatrix3(new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld))
           : new THREE.Vector3(0, 1, 0);
 
-      // chave crua (upld) do OBJ
-      const objectKeyRaw = root?.name || hit.object.name || "";
-      const objectKey = norm(objectKeyRaw);
-
-      // mapeia pelo índice ENGE
-      let displayName = objectKey;
-      let meta = null;
-      if (engeIndex && engeIndex.has(objectKey)) {
-        meta = engeIndex.get(objectKey);
-        if (meta?.type) displayName = String(meta.type);
-      }
-
-      // evita duplicidade por peça exibida
-      if (annotationsRef.current.some((a) => a.objectKey === objectKey)) {
-        alert("Já existe uma anotação para esta peça. Edite a anotação existente.");
+      const pieceName = (root && root.name) || hit.object.name || "";
+      if (annotationsRef.current.some((a) => a.objectName === pieceName)) {
+        alert("Já existe uma anotação para esta peça.");
         return;
       }
-
+      const id = uuidv4();
       const ann = {
         id,
         position: [hit.point.x, hit.point.y, hit.point.z],
         normal: [normal.x, normal.y, normal.z],
-        objectKey, // upld (nome do mesh no OBJ)
-        objectName: displayName, // mostrado (type se houver; senão, upld)
-        meta, // {lt_id, handle, position, profile, quadrant, component, tower_id, type}
+        objectName: pieceName,
         issueType: DEFAULT_ISSUES[0],
         severity: DEFAULT_SEVERITIES[1],
         status: DEFAULT_STATUSES[0],
@@ -415,33 +296,32 @@ export default function App3DAnnotations() {
         photos: [],
         createdAt: new Date().toISOString(),
       };
-
       addPin(ann);
       setAnnotations((prev) => [ann, ...prev]);
       setSelectedId(id);
-      colorizePieceByStatus(objectKey, ann.status);
+      colorizePieceByStatus(pieceName, ann.status);
     };
     renderer.domElement.addEventListener("click", onClick, { passive: true });
 
-    let rafId;
+    let raf;
     const animate = () => {
-      rafId = requestAnimationFrame(animate);
+      raf = requestAnimationFrame(animate);
       controls.update();
       renderer.render(scene, camera);
     };
     animate();
 
     return () => {
-      cancelAnimationFrame(rafId);
+      cancelAnimationFrame(raf);
       renderer.domElement.removeEventListener("click", onClick);
       ro.disconnect();
       controls.dispose();
       renderer.dispose();
-      renderer.domElement?.parentElement?.removeChild(renderer.domElement);
+      if (renderer.domElement?.parentElement) renderer.domElement.parentElement.removeChild(renderer.domElement);
     };
-  }, [colorizePiece, colorizePieceByStatus, engeIndex]);
+  }, []);
 
-  /* ----- load OBJ/MTL ----- */
+  /* Load OBJ/MTL */
   async function handleLoadOBJFromFiles(objFile, mtlFile) {
     setLoading(true);
     try {
@@ -458,12 +338,14 @@ export default function App3DAnnotations() {
 
       const group = loader.parse(objText);
       group.name = objFile.name.toLowerCase().endsWith(".obj") ? objFile.name.slice(0, -4) : objFile.name;
-      group.traverse((child) => {
-        if (child.isMesh && child.material) {
-          child.castShadow = false;
-          child.receiveShadow = false;
-          child.material.side = THREE.FrontSide;
-          child.material.needsUpdate = true;
+      group.traverse((ch) => {
+        if (ch.isMesh) {
+          ch.castShadow = false;
+          ch.receiveShadow = false;
+          if (ch.material) {
+            ch.material.side = THREE.FrontSide;
+            ch.material.needsUpdate = true;
+          }
         }
       });
 
@@ -476,121 +358,120 @@ export default function App3DAnnotations() {
       setModelGroup(group);
       modelGroupRef.current = group;
       setModelInfo({ name: objFile.name, size: objFile.size });
-
       fitCameraToObject(cameraRef.current, group, controlsRef.current, 1.3);
 
-      const firstMtllib = objText
-        .split(/\r?\n/)
-        .map((l) => l.trim())
-        .find((l) => l.toLowerCase().startsWith("mtllib "));
-      const hinted = firstMtllib ? firstMtllib.slice(7).trim() : null;
-      setMtlHint(!mtlFile && hinted ? hinted : null);
+      const firstMtllib = objText.split(/\r?\n/).map((l) => l.trim()).find((l) => l.toLowerCase().startsWith("mtllib "));
+      setMtlHint(!mtlFile && firstMtllib ? firstMtllib.slice(7).trim() : null);
     } catch (e) {
       console.error(e);
-      alert("Falha ao carregar o OBJ. Verifique o arquivo.");
+      alert("Falha ao carregar o OBJ.");
     } finally {
       setLoading(false);
     }
   }
 
-  /* ----- pins & isolation helpers ----- */
+  /* Pinos & isolamento */
   function clearPins() {
     [...pinsGroup.children].forEach((c) => pinsGroup.remove(c));
   }
   function addPin(ann) {
     const color = STATUS_COLORS[ann.status] || 0x0070f3;
-    const geo = new THREE.SphereGeometry(0.02, 16, 16);
-    const mat = new THREE.MeshStandardMaterial({ color });
-    const mesh = new THREE.Mesh(geo, mat);
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.02, 16, 16), new THREE.MeshStandardMaterial({ color }));
     mesh.position.set(ann.position[0], ann.position[1], ann.position[2]);
     mesh.userData.annotationId = ann.id;
     pinsGroup.add(mesh);
   }
+  function getPieceRoot(obj) {
+    let cur = obj,
+      root = modelGroupRef.current;
+    while (cur && cur.parent && cur.parent !== root) cur = cur.parent;
+    return cur || obj;
+  }
   function clearIsolation() {
-    if (!modelGroupRef.current) return;
-    modelGroupRef.current.traverse((n) => {
-      if (!n.isMesh || !n.userData?.originalMaterial) return;
-      n.material = n.userData.originalMaterial;
-      n.material.needsUpdate = true;
+    const map = isolationMapRef.current;
+    if (!map.size) return;
+    map.forEach((saved, mesh) => {
+      if (saved.material) {
+        mesh.material.dispose?.();
+        mesh.material = saved.material;
+      }
+      if (typeof saved.visible === "boolean") mesh.visible = saved.visible;
     });
+    map.clear();
     setIsolatedUuid(null);
+  }
+  function applyIsolation(targetRoot) {
+    if (!modelGroupRef.current) return;
+    clearIsolation();
+    const map = isolationMapRef.current;
+    const keep = new Set();
+    targetRoot.traverse((n) => {
+      if (n.isMesh) keep.add(n);
+    });
+    modelGroupRef.current.traverse((n) => {
+      if (!n.isMesh) return;
+      if (!map.has(n)) map.set(n, { material: n.material, visible: n.visible });
+      if (keep.has(n)) {
+        colorizePiece(n, 0x3399ff);
+      } else {
+        const faded = n.material.clone();
+        faded.transparent = true;
+        faded.opacity = 0.12;
+        faded.depthWrite = false;
+        n.material = faded;
+      }
+    });
+    setIsolatedUuid(targetRoot.uuid);
   }
   function findPieceForAnnotation(ann) {
     if (!modelGroupRef.current || !ann) return null;
-    const name = ann.objectKey || ann.objectName;
-    if (name) {
+    if (ann.objectName) {
       let byName = null;
       modelGroupRef.current.traverse((n) => {
-        if (!byName && n.name && n.name === name) byName = n;
+        if (!byName && n.name === ann.objectName) byName = n;
       });
-      if (byName) return byName;
+      if (byName) return getPieceRoot(byName);
+    }
+    if (ann.position?.length === 3) {
+      const target = new THREE.Vector3(...ann.position);
+      let best = { node: null, dist: Infinity };
+      modelGroupRef.current.traverse((n) => {
+        if (!n.isMesh) return;
+        const c = new THREE.Box3().setFromObject(n).getCenter(new THREE.Vector3());
+        const d = c.distanceTo(target);
+        if (d < best.dist) best = { node: n, dist: d };
+      });
+      if (best.node) return getPieceRoot(best.node);
     }
     return null;
   }
-  function fitCameraToObject(camera, object, controls, offset = 1.25) {
-    const box = new THREE.Box3().setFromObject(object);
-    const size = box.getSize(new THREE.Vector3());
-    const center = box.getCenter(new THREE.Vector3());
-    const maxSize = Math.max(size.x, size.y, size.z);
-    const fitHeightDistance = maxSize / (2 * Math.tan((Math.PI * camera.fov) / 360));
-    const fitWidthDistance = fitHeightDistance / camera.aspect;
-    const distance = offset * Math.max(fitHeightDistance, fitWidthDistance);
-    const dir = camera.position.clone().sub(controls.target).normalize();
-    controls.target.copy(center);
-    camera.near = Math.max(0.1, distance / 100);
-    camera.far = distance * 100;
-    camera.updateProjectionMatrix();
-    camera.position.copy(center.clone().add(dir.multiplyScalar(distance)));
-    controls.update();
-  }
 
-  /* ----- update visuals pins ----- */
   useEffect(() => {
     pinsGroup.children.forEach((mesh) => {
       const id = mesh.userData.annotationId;
       const ann = annotations.find((a) => a.id === id);
       if (!ann) return;
-      const color = STATUS_COLORS[ann.status] || 0x0070f3;
-      mesh.material.color.set(color);
+      mesh.material.color.set(STATUS_COLORS[ann.status] || 0x0070f3);
       mesh.scale.setScalar(selectedId === id ? 1.6 : 1.0);
     });
   }, [annotations, selectedId, pinsGroup]);
 
-  /* ----- ações ----- */
   function onSelectAnnotation(id) {
     setSelectedId(id);
     const ann = annotations.find((a) => a.id === id);
-    if (!ann) return;
-
-    if (isIsolationModeRef.current) {
-      const piece = findPieceForAnnotation(ann);
-      if (piece) {
-        // aplica isolamento simples (destaca selecionada e esmaece outras)
-        modelGroupRef.current.traverse((n) => {
-          if (!n.isMesh) return;
-          if (n === piece || piece.parent === n || n.parent === piece) colorizePiece(n, 0x3399ff);
-          else {
-            const faded = n.material.clone();
-            faded.transparent = true;
-            faded.opacity = 0.1;
-            faded.depthWrite = false;
-            n.material = faded;
-          }
-        });
-        setIsolatedUuid(piece.uuid);
-      }
+    if (isIsolationModeRef.current && ann) {
+      const root = findPieceForAnnotation(ann);
+      if (root) applyIsolation(root);
     }
+    if (ann?.objectName) colorizePieceByStatus(ann.objectName, ann.status);
 
-    if (ann.objectKey) colorizePieceByStatus(ann.objectKey, ann.status);
-
-    const controls = controlsRef.current;
-    const cam = cameraRef.current;
+    const controls = controlsRef.current,
+      cam = cameraRef.current;
     const dist = cam.position.distanceTo(controls.target);
     let targetPos = null;
     const pin = pinsGroup.children.find((m) => m.userData.annotationId === id);
     if (pin) targetPos = pin.position.clone();
-    else if (ann.position) targetPos = new THREE.Vector3(ann.position[0], ann.position[1], ann.position[2]);
-
+    else if (ann?.position) targetPos = new THREE.Vector3(...ann.position);
     if (targetPos) {
       controls.target.copy(targetPos);
       const dir = cam.position.clone().sub(controls.target).normalize();
@@ -598,248 +479,246 @@ export default function App3DAnnotations() {
       controls.update();
     }
   }
-
   function onDeleteAnnotation(id) {
     const ann = annotations.find((a) => a.id === id);
-    if (ann?.objectKey) restorePieceColor(ann.objectKey);
+    if (ann?.objectName) restorePieceColor(ann.objectName);
     setAnnotations((prev) => prev.filter((a) => a.id !== id));
     const idx = pinsGroup.children.findIndex((m) => m.userData.annotationId === id);
     if (idx >= 0) pinsGroup.remove(pinsGroup.children[idx]);
     if (selectedId === id) setSelectedId(null);
   }
-
   function onUpdateAnnotation(id, patch) {
     setAnnotations((prev) => {
-      const updated = prev.map((a) => (a.id === id ? { ...a, ...patch } : a));
+      const up = prev.map((a) => (a.id === id ? { ...a, ...patch } : a));
       if (patch.status) {
-        const ann = updated.find((a) => a.id === id);
-        if (ann?.objectKey) colorizePieceByStatus(ann.objectKey, patch.status);
+        const ann = up.find((a) => a.id === id);
+        if (ann?.objectName) colorizePieceByStatus(ann.objectName, patch.status);
       }
-      return updated;
+      return up;
     });
   }
-
   async function handleAddPhoto(annotationId, file) {
     try {
       const url = await uploadPhoto(file, annotationId);
-      if (!url) throw new Error("URL pública não retornada.");
       setAnnotations((prev) =>
         prev.map((a) =>
           a.id === annotationId
-            ? {
-                ...a,
-                photos: [
-                  ...(a.photos || []),
-                  { id: uuidv4(), name: file.name, url, createdAt: new Date().toISOString() },
-                ],
-              }
+            ? { ...a, photos: [...(a.photos || []), { id: uuidv4(), name: file.name, url, createdAt: new Date().toISOString() }] }
             : a
         )
       );
       alert("Foto enviada com sucesso!");
     } catch (err) {
-      console.error("Erro ao enviar foto:", err);
-      alert("Falha ao enviar a foto. Veja o console para detalhes.");
+      console.error(err);
+      alert("Falha ao enviar a foto. Veja o console.");
     }
   }
 
-  /* ----- remap com índice quando ele chega (para anotações antigas/localStorage) ----- */
-  function remapWithIndex(arr, idx) {
-    if (!idx) return arr;
-    return (arr || []).map((a) => {
-      const key = norm(a.objectKey || a.objectName || "");
-      const m = idx.get(key);
-      if (m) {
-        return { ...a, objectKey: key, objectName: m.type || key, meta: { ...m } };
-      }
-      return { ...a, objectKey: key };
-    });
-  }
-  useEffect(() => {
-    if (!engeIndex || !annotations.length) return;
-    setAnnotations((prev) => remapWithIndex(prev, engeIndex));
-  }, [engeIndex]); // eslint-disable-line
-
-  /* ----- export / import / screenshot ----- */
   function onExportJSON() {
     const payload = { model: modelInfo.name, exportedAt: new Date().toISOString(), annotations };
     downloadBlob(JSON.stringify(payload, null, 2), (modelInfo.name || "modelo") + ".anotacoes.json", "application/json");
   }
-
   async function onExportXLSX() {
-    if (!annotations.length) return alert("Nenhuma anotação para exportar!");
-    const rows = filteredAnnotations.map((ann, idx) => ({
-      "#": idx + 1,
+    if (!annotations.length) {
+      alert("Nenhuma anotação para exportar!");
+      return;
+    }
+    const rows = annotations.map((ann, i) => ({
+      "#": i + 1,
       ID: ann.id,
       Modelo: modelInfo.name || "",
       "Criado em": new Date(ann.createdAt).toLocaleString(),
-      "Peça (exibida)": ann.objectName || "",
-      upld: ann.objectKey || "",
+      Peça: ann.objectName || "",
       Tipo: ann.issueType || "",
       Severidade: ann.severity || "",
       Status: ann.status || "",
-      Componente: ann.meta?.component || "",
-      Handle: ann.meta?.handle || "",
-      Posição: ann.meta?.position || "",
-      Perfil: ann.meta?.profile || "",
-      Quadrante: ann.meta?.quadrant ?? "",
-      "LT ID": ann.meta?.lt_id ?? "",
-      "Tower ID": ann.meta?.tower_id ?? "",
       Observações: ann.note || "",
       Fotos: (ann.photos || []).map((p) => p.url).join("\n"),
-      "Posição (x,y,z)": Array.isArray(ann.position) ? ann.position.map((n) => +n).join(", ") : "",
-      "Normal (x,y,z)": Array.isArray(ann.normal) ? ann.normal.map((n) => +n).join(", ") : "",
+      "Posição (x,y,z)": ann.position?.map((n) => +n).join(", ") || "",
+      "Normal (x,y,z)": ann.normal?.map((n) => +n).join(", ") || "",
     }));
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Anotações");
     const ab = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-    const blob = new Blob([ab], {
-      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    });
-    downloadBlob(blob, (modelInfo.name || "modelo") + ".anotacoes.xlsx", blob.type);
+    downloadBlob(
+      new Blob([ab], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+      (modelInfo.name || "modelo") + ".anotacoes.xlsx"
+    );
   }
-
   function onImportJSON(file) {
     const fr = new FileReader();
     fr.onload = () => {
       try {
         const data = JSON.parse(fr.result);
         if (!Array.isArray(data.annotations)) throw new Error("JSON inválido");
-        setAnnotations(remapWithIndex(data.annotations, engeIndex));
+        annotations.forEach((a) => a.objectName && restorePieceColor(a.objectName));
+        setAnnotations(data.annotations);
         clearPins();
         data.annotations.forEach(addPin);
-        data.annotations.forEach((ann) => {
-          const key = ann.objectKey || ann.objectName;
-          if (key) colorizePieceByStatus(key, ann.status);
-        });
+        data.annotations.forEach((a) => a.objectName && colorizePieceByStatus(a.objectName, a.status));
         alert("Anotações importadas: " + data.annotations.length);
       } catch {
-        alert("Falha ao ler JSON de anotações.");
+        alert("Falha ao ler JSON.");
       }
     };
     fr.readAsText(file);
   }
 
-  function onScreenshot() {
-    const renderer = rendererRef.current;
-    if (!renderer) return;
-    renderer.domElement.toBlob((blob) => blob && downloadBlob(blob, "screenshot.png", "image/png"));
-  }
-
-  /* ----- persistência por modelo ----- */
   useEffect(() => {
     if (!modelInfo.name) return;
-    const key = "ann:" + modelInfo.name;
-    const saved = readPersistedAnnotations(key);
+    const saved = readPersistedAnnotations("ann:" + modelInfo.name);
     if (saved) {
       clearPins();
-      const remapped = remapWithIndex(saved, engeIndex);
-      setAnnotations(remapped);
-      remapped.forEach(addPin);
-      remapped.forEach((a) => a.objectKey && colorizePieceByStatus(a.objectKey, a.status));
+      setAnnotations(saved);
+      saved.forEach(addPin);
+      saved.forEach((a) => a.objectName && colorizePieceByStatus(a.objectName, a.status));
     }
-  }, [modelInfo.name, engeIndex]); // eslint-disable-line
-
+    // eslint-disable-next-line
+  }, [modelInfo.name]);
   useEffect(() => {
     if (!modelInfo.name) return;
     persistAnnotations("ann:" + modelInfo.name, annotations);
+    // eslint-disable-next-line
   }, [annotations, modelInfo.name]);
 
-  /* ----- filtro por component ----- */
-  const filteredAnnotations = useMemo(
-    () =>
-      annotations.filter((a) => !componentFilter || (a.meta?.component || "") === componentFilter),
-    [annotations, componentFilter]
-  );
-
-  /* ----- UI helpers ----- */
   function handleFilesChosen(files) {
     const arr = Array.from(files || []);
     const obj = arr.find((f) => f.name.toLowerCase().endsWith(".obj"));
     const mtl = arr.find((f) => f.name.toLowerCase().endsWith(".mtl"));
-    if (!obj) return alert("Selecione um arquivo .obj (e opcionalmente .mtl).");
+    if (!obj) {
+      alert("Selecione um .obj (opcional .mtl).");
+      return;
+    }
     handleLoadOBJFromFiles(obj, mtl || null);
   }
 
-  /* =========================
+  /* ===========================
      UI
-     ========================= */
+  ============================ */
   return (
-    <div className="w-full h-screen flex flex-col bg-[#0b0f14] text-white overflow-hidden">
-      {/* App Bar */}
-      <div className="sticky top-0 z-20 bg-[#0d131a]/90 backdrop-blur border-b border-white/10">
-        <div className="flex items-center gap-3 p-3">
-          <label className="px-4 py-2 rounded-lg bg-[#26405d] hover:bg-[#31587f] transition cursor-pointer">
-            📁 Carregar Modelo
+    <div style={{ background: THEME.bgApp }} className="w-full h-screen flex flex-col text-white overflow-hidden">
+      {/* HEADER */}
+      <header
+        className="w-full flex-shrink-0"
+        style={{ height: HEADER_H, background: THEME.primary, borderBottom: `1px solid ${THEME.border}` }}
+      >
+        <div className="h-full max-w-full mx-auto flex items-center gap-10 px-4">
+          <div className="mr-auto">
+            <div className="text-lg font-semibold" style={{ color: THEME.text }}>
+              PHD Tech - 3D Inspector Pro
+            </div>
+            <div className="text-xs" style={{ color: THEME.textDim }}>
+              Anotação e inspeção 3D
+            </div>
+          </div>
+
+          {/* Carregar */}
+          <label className="cursor-pointer">
+            <div
+              className="px-4 py-2 rounded-md font-medium"
+              style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
+            >
+              ☁️ Carregar Modelo
+            </div>
             <input type="file" accept=".obj,.mtl" className="hidden" multiple onChange={(e) => handleFilesChosen(e.target.files)} />
           </label>
 
+          {/* Anotar */}
           <button
             onClick={() => setIsPlacing((v) => !v)}
-            className={`px-4 py-2 rounded-lg transition ${
-              isPlacing ? "bg-[#00a49a] text-black" : "bg-[#18212b] hover:bg-[#1b2631] border border-white/10"
-            }`}
+            className="px-4 py-2 rounded-md font-medium"
+            style={{
+              background: isPlacing ? THEME.action1 : "#0b1622",
+              border: `1px solid ${THEME.border}`,
+              color: isPlacing ? "#062a27" : THEME.text,
+            }}
             title="Toque no modelo para marcar"
           >
-            {isPlacing ? "📍 Marcando…" : "📌 Anotar"}
+            {isPlacing ? "Marcando…" : "Anotar"}
           </button>
 
+          {/* Isolar */}
           <button
-            onClick={() => setIsIsolationMode((v) => !v)}
-            className={`px-4 py-2 rounded-lg transition ${
-              isIsolationMode ? "bg-[#b85236]" : "bg-[#18212b] hover:bg-[#1b2631] border border-white/10"
-            }`}
+            onClick={() => {
+              setIsolationMode((v) => {
+                const n = !v;
+                if (!n) clearIsolation();
+                return n;
+              });
+            }}
+            className="px-4 py-2 rounded-md font-medium"
+            style={{
+              background: isolationMode ? THEME.action2 : "#0b1622",
+              border: `1px solid ${THEME.border}`,
+              color: isolationMode ? "#2b0d08" : THEME.text,
+            }}
             title="Isolar peças ao clicar"
           >
-            {isIsolationMode ? "🔍 Isolando" : "🔍 Isolar"}
+            Isolar
           </button>
 
+          {/* Enquadrar – agora no topo também */}
           <button
             onClick={() =>
-              modelGroupRef.current &&
-              fitCameraToObject(cameraRef.current, modelGroupRef.current, controlsRef.current, 1.25)
+              modelGroupRef.current && fitCameraToObject(cameraRef.current, modelGroupRef.current, controlsRef.current, 1.25)
             }
-            className="px-4 py-2 rounded-lg bg-[#18212b] hover:bg-[#1b2631] border border-white/10"
-            title="Enquadrar modelo"
+            className="px-4 py-2 rounded-md font-medium"
+            style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
           >
-            🎯 Enquadrar
+            Enquadrar
           </button>
-
-          <div className="ml-auto text-sm text-white/80">
-            {modelInfo.name ? (
-              <>
-                <span className="font-medium">Modelo:</span> {modelInfo.name} · {humanFileSize(modelInfo.size)}
-              </>
-            ) : (
-              "Carregue um arquivo .obj (e .mtl) para começar"
-            )}
-          </div>
         </div>
+      </header>
+
+      {/* SUBBAR */}
+      <div
+        className="w-full flex-shrink-0 flex items-center px-4 text-sm"
+        style={{ height: SUBBAR_H, background: "#0b1622", borderBottom: `1px solid ${THEME.border}`, color: THEME.textDim }}
+      >
+        {modelInfo.name ? (
+          <span>
+            <span style={{ color: THEME.text }}>Modelo:</span> {modelInfo.name} · {humanFileSize(modelInfo.size)}
+          </span>
+        ) : (
+          "Carregue um arquivo .obj (e .mtl) para começar"
+        )}
       </div>
 
-      {/* Área 3D */}
-      <div className="flex-1 relative">
+      {/* MAIN STAGE */}
+      <div className="relative flex-1">
         <div ref={mountRef} className="absolute inset-0" />
-        {/* FABs */}
-        <div className="absolute bottom-6 right-6 flex flex-col gap-3">
+
+        <div
+          className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 px-3 py-1 text-xs rounded"
+          style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+        >
+          1 dedo gira · 2 dedos move/zoom
+        </div>
+
+        {/* FABs (mantidos) */}
+        <div className="absolute bottom-4 right-4 flex flex-col gap-2">
           <button
-            onClick={onScreenshot}
-            className="w-14 h-14 rounded-full bg-[#18212b] border border-white/10 hover:bg-[#1b2631] grid place-items-center"
+            onClick={() =>
+              modelGroupRef.current && fitCameraToObject(cameraRef.current, modelGroupRef.current, controlsRef.current, 1.25)
+            }
+            className="w-12 h-12 rounded-md font-semibold grid place-items-center"
+            style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
           >
-            📸
+            🎯
           </button>
           <button
-            onClick={() => setSidebarCollapsed((v) => !v)}
-            className="w-14 h-14 rounded-full bg-[#18212b] border border-white/10 hover:bg-[#1b2631] grid place-items-center"
+            onClick={() => setSidebarOpen((o) => !o)}
+            className="w-12 h-12 rounded-md font-semibold grid place-items-center"
+            style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
           >
-            {sidebarCollapsed ? "📋" : "✕"}
+            {sidebarOpen ? "✕" : "📋"}
           </button>
         </div>
 
         {loading && (
-          <div className="absolute inset-0 grid place-items-center bg-black/60 z-30">
-            <div className="animate-pulse text-base bg-[#0f141a] rounded-xl shadow px-6 py-4 border border-white/10">
+          <div className="absolute inset-0 grid place-items-center" style={{ background: "rgba(0,0,0,.4)" }}>
+            <div className="px-4 py-2 rounded-md" style={{ background: "#102031", border: `1px solid ${THEME.border}`, color: THEME.text }}>
               Carregando modelo…
             </div>
           </div>
@@ -847,20 +726,20 @@ export default function App3DAnnotations() {
 
         {/* Photo Viewer */}
         {photoViewer.open && (
-          <div className="absolute inset-0 z-40 bg-black/90 grid place-items-center p-4">
+          <div className="absolute inset-0 z-40 grid place-items-center" style={{ background: "rgba(0,0,0,.9)" }}>
             <button
               onClick={() => setPhotoViewer({ open: false, url: "", name: "" })}
-              className="absolute top-4 right-4 bg-white/10 text-white backdrop-blur px-4 py-2 rounded-full border border-white/20"
+              className="absolute top-4 right-4 px-3 py-1 rounded-md"
+              style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
             >
               Fechar ✕
             </button>
-            <img
-              src={photoViewer.url}
-              alt={photoViewer.name || "Foto"}
-              className="max-h-[90vh] max-w-[92vw] object-contain rounded-xl shadow-2xl"
-            />
+            <img src={photoViewer.url} alt={photoViewer.name || "Foto"} className="max-h-[90vh] max-w-[92vw] object-contain rounded-md" />
             {photoViewer.name && (
-              <div className="absolute bottom-5 left-1/2 -translate-x-1/2 text-white/90 text-sm bg-white/10 backdrop-blur px-3 py-1 rounded-full">
+              <div
+                className="absolute bottom-5 left-1/2 -translate-x-1/2 px-2 py-1 text-xs rounded"
+                style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+              >
                 {photoViewer.name}
               </div>
             )}
@@ -868,184 +747,199 @@ export default function App3DAnnotations() {
         )}
       </div>
 
-      {/* Sidebar */}
+      {/* SIDEBAR – agora com top calculado e rolável */}
       <div
-        className={`absolute right-0 top-0 bottom-0 w-full max-w-md bg-[#0f141a] border-l border-white/10 z-30 transform transition-transform duration-300 ${
-          sidebarCollapsed ? "translate-x-full" : "translate-x-0"
-        }`}
+        style={{
+          position: "absolute",
+          right: 0,
+          top: HEADER_H + SUBBAR_H, // respeita header + subbar
+          bottom: 0,
+          width: "100%",
+          maxWidth: "28rem",
+          background: THEME.primary,
+          borderLeft: `1px solid ${THEME.border}`,
+          transform: sidebarOpen ? "translateX(0)" : "translateX(100%)",
+          transition: "transform 300ms ease-out",
+          display: "flex",
+          flexDirection: "column",
+          zIndex: 20,
+        }}
       >
-        <div className="p-4 border-b border-white/10 flex items-center justify-between">
-          <div>
-            <div className="text-lg font-semibold">Anotações</div>
-            <div className="text-xs text-white/60">{filteredAnnotations.length} item(s)</div>
+        {/* Cabeçalho do painel */}
+        <div className="p-4" style={{ borderBottom: `1px solid ${THEME.border}` }}>
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-lg font-semibold" style={{ color: THEME.text }}>
+                Anotações
+              </div>
+              <div className="text-xs" style={{ color: THEME.textDim }}>
+                {annotations.length} item(s)
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={onExportJSON}
+                className="px-3 py-2 rounded-md text-sm font-medium"
+                style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
+              >
+                JSON
+              </button>
+              <button
+                onClick={onExportXLSX}
+                className="px-3 py-2 rounded-md text-sm font-medium"
+                style={{ background: THEME.action3, color: "#2b1405" }}
+              >
+                Excel
+              </button>
+            </div>
           </div>
-          <div className="flex gap-2">
-            <button onClick={onExportJSON} className="px-3 py-2 rounded bg-[#18212b] border border-white/10 hover:bg-[#1b2631] text-sm">
-              JSON
-            </button>
-            <button onClick={onExportXLSX} className="px-3 py-2 rounded bg-[#00a49a] text-black hover:brightness-95 text-sm">
-              Excel
-            </button>
-            <button onClick={() => setSidebarCollapsed(true)} className="px-3 py-2 rounded bg-[#18212b] border border-white/10 hover:bg-[#1b2631]">
-              ✕
-            </button>
-          </div>
-        </div>
 
-        {/* Import */}
-        <div className="p-4 border-b border-white/10">
-          <label className="block text-sm text-white/80 mb-2">Importar anotações (JSON)</label>
-          <input
-            type="file"
-            accept="application/json"
-            onChange={(e) => e.target.files?.[0] && onImportJSON(e.target.files[0])}
-            className="block w-full text-sm p-2 bg-[#0b0f14] border border-white/10 rounded"
-          />
-        </div>
-
-        {/* Filtro por component */}
-        <div className="p-4 border-b border-white/10">
-          <label className="block text-sm text-white/80 mb-2">Filtrar por Component</label>
-          <select
-            value={componentFilter}
-            onChange={(e) => setComponentFilter(e.target.value)}
-            className="w-full rounded bg-[#0b0f14] border border-white/10 text-sm p-2"
-          >
-            <option value="">— Todos —</option>
-            {componentOptions.map((c) => (
-              <option key={c} value={c}>
-                {c}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        {/* Lista */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {filteredAnnotations.map((ann) => (
+          {mtlHint && (
             <div
-              key={ann.id}
-              className={`rounded-xl border ${selectedId === ann.id ? "border-[#00a49a]" : "border-white/10"} bg-[#0b0f14] p-4`}
+              className="mt-3 text-xs px-3 py-2 rounded-md"
+              style={{ background: "#102031", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
             >
-              <div className="flex items-start justify-between gap-3 mb-3">
-                <button onClick={() => onSelectAnnotation(ann.id)} className="text-left flex-1">
-                  <div className="text-base font-semibold">{ann.issueType}</div>
-                  <div className="text-xs text-white/70">Peça (exibida): {ann.objectName || "-"}</div>
-                  <div className="text-[11px] text-white/50">upld: {ann.objectKey || "-"}</div>
-                  <div className="text-xs text-white/50 mt-1">{new Date(ann.createdAt).toLocaleString()}</div>
+              OBJ referencia: <span className="font-mono" style={{ color: THEME.text }}>{mtlHint}</span>
+            </div>
+          )}
+
+          <div className="mt-3">
+            <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+              Importar anotações (JSON)
+            </label>
+            <input
+              type="file"
+              accept="application/json"
+              onChange={(e) => e.target.files?.[0] && onImportJSON(e.target.files[0])}
+              className="block w-full text-sm px-3 py-2 rounded-md"
+              style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
+            />
+          </div>
+        </div>
+
+        {/* Lista – área rolável */}
+        <div className="p-4 space-y-3" style={{ flex: 1, overflowY: "auto" }}>
+          {annotations.map((ann) => (
+            <div key={ann.id} className="rounded-md p-3" style={{ background: "#0b1622", border: `1px solid ${THEME.border}` }}>
+              <div className="flex items-start justify-between">
+                <button onClick={() => onSelectAnnotation(ann.id)} className="text-left">
+                  <div className="font-semibold" style={{ color: THEME.text }}>
+                    {ann.issueType}
+                  </div>
+                  <div className="text-xs" style={{ color: THEME.textDim }}>
+                    {ann.objectName || "Peça"}
+                  </div>
+                  <div className="text-xs" style={{ color: THEME.textDim }}>
+                    {new Date(ann.createdAt).toLocaleString()}
+                  </div>
                 </button>
-                <span className="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-[#18212b]">
-                  <span
-                    className="w-2.5 h-2.5 rounded-full"
-                    style={{ backgroundColor: `#${(STATUS_COLORS[ann.status] || 0x0070f3).toString(16).padStart(6, "0")}` }}
-                  />
+                <span
+                  className="text-xs px-2 py-1 rounded-full"
+                  style={{ background: "#122232", border: `1px solid ${THEME.border}`, color: THEME.text }}
+                >
                   {ann.status}
                 </span>
               </div>
 
-              {/* Metadados do ENGE */}
-              <div className="grid grid-cols-2 gap-3 mb-3 text-xs">
-                <div><span className="text-white/60">Component:</span> {ann.meta?.component || "-"}</div>
-                <div><span className="text-white/60">Handle:</span> {ann.meta?.handle || "-"}</div>
-                <div><span className="text-white/60">Posição:</span> {ann.meta?.position || "-"}</div>
-                <div><span className="text-white/60">Perfil:</span> {ann.meta?.profile || "-"}</div>
-                <div><span className="text-white/60">Quadrante:</span> {ann.meta?.quadrant ?? "-"}</div>
-                <div><span className="text-white/60">LT ID:</span> {ann.meta?.lt_id ?? "-"}</div>
-                <div><span className="text-white/60">Tower ID:</span> {ann.meta?.tower_id ?? "-"}</div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-2 gap-2 mt-3">
                 <div>
-                  <label className="block text-xs text-white/70 mb-1">Tipo</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Tipo
+                  </label>
                   <select
                     value={ann.issueType}
                     onChange={(e) => onUpdateAnnotation(ann.id, { issueType: e.target.value })}
-                    className="w-full rounded border border-white/10 bg-[#0f141a] text-sm p-2"
+                    className="w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
                   >
-                    {DEFAULT_ISSUES.map((opt) => (
-                      <option key={opt} value={opt}>
-                        {opt}
+                    {DEFAULT_ISSUES.map((o) => (
+                      <option key={o} value={o}>
+                        {o}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs text-white/70 mb-1">Severidade</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Severidade
+                  </label>
                   <select
                     value={ann.severity}
                     onChange={(e) => onUpdateAnnotation(ann.id, { severity: e.target.value })}
-                    className="w-full rounded border border-white/10 bg-[#0f141a] text-sm p-2"
+                    className="w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
                   >
-                    {DEFAULT_SEVERITIES.map((opt) => (
-                      <option key={opt} value={opt}>
-                        {opt}
+                    {DEFAULT_SEVERITIES.map((o) => (
+                      <option key={o} value={o}>
+                        {o}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs text-white/70 mb-1">Status</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Status
+                  </label>
                   <select
                     value={ann.status}
                     onChange={(e) => onUpdateAnnotation(ann.id, { status: e.target.value })}
-                    className="w-full rounded border border-white/10 bg-[#0f141a] text-sm p-2"
+                    className="w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
                   >
-                    {DEFAULT_STATUSES.map((opt) => (
-                      <option key={opt} value={opt}>
-                        {opt}
+                    {DEFAULT_STATUSES.map((o) => (
+                      <option key={o} value={o}>
+                        {o}
                       </option>
                     ))}
                   </select>
                 </div>
-
-                {/* Peça exibida somente leitura (vem do índice) */}
                 <div>
-                  <label className="block text-xs text-white/70 mb-1">Peça (exibida)</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Peça
+                  </label>
                   <input
                     value={ann.objectName || ""}
-                    readOnly
-                    className="w-full rounded border border-white/10 bg-[#0f141a] text-sm p-2 opacity-80"
+                    onChange={(e) => onUpdateAnnotation(ann.id, { objectName: e.target.value })}
+                    className="w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
+                    placeholder="Ex: Braço, Base, Travessa"
                   />
-                  <div className="text-[11px] text-white/40 mt-1">upld: {ann.objectKey || "-"}</div>
                 </div>
 
                 {/* Upload foto */}
                 <div className="col-span-2">
-                  <label className="block text-xs text-white/70 mb-1">Adicionar foto</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Adicionar foto
+                  </label>
                   <input
                     type="file"
                     accept="image/*"
                     onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file) handleAddPhoto(ann.id, file);
+                      const f = e.target.files?.[0];
+                      if (f) handleAddPhoto(ann.id, f);
                       e.currentTarget.value = "";
                     }}
-                    className="block w-full text-sm p-2 bg-[#0b0f14] border border-white/10 rounded"
+                    className="block w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
                   />
                 </div>
 
                 {/* Thumbs */}
                 {ann.photos?.length > 0 && (
                   <div className="col-span-2">
-                    <div className="text-sm text-white/70 mb-2">Fotos ({ann.photos.length})</div>
+                    <div className="text-xs mb-2" style={{ color: THEME.textDim }}>
+                      Fotos ({ann.photos.length})
+                    </div>
                     <div className="grid grid-cols-4 gap-2">
                       {ann.photos.map((p) => (
                         <button
                           key={p.id}
-                          type="button"
                           onClick={() => setPhotoViewer({ open: true, url: p.url, name: p.name })}
-                          className="aspect-square overflow-hidden rounded border border-white/10"
+                          className="aspect-square rounded-md overflow-hidden"
+                          style={{ border: `1px solid ${THEME.border}` }}
                           title={p.name}
                         >
-                          <img
-                            src={p.url}
-                            alt={p.name}
-                            className="w-full h-full object-cover"
-                            onError={(ev) => {
-                              ev.currentTarget.src =
-                                "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIwIiBoZWlnaHQ9IjkwIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjxyZWN0IHdpZHRoPSIxMjAiIGhlaWdodD0iOTAiIGZpbGw9IiMxMzEzMTMiLz48dGV4dCB4PSI2MCIgeT0iNDUiIGZvbnQtc2l6ZT0iMTIiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGZpbGw9IiNmZmYiPkVycm88L3RleHQ+PC9zdmc+";
-                            }}
-                          />
+                          <img src={p.url} alt={p.name} className="w-full h-full object-cover" />
                         </button>
                       ))}
                     </div>
@@ -1053,26 +947,31 @@ export default function App3DAnnotations() {
                 )}
 
                 <div className="col-span-2">
-                  <label className="block text-xs text-white/70 mb-1">Observações</label>
+                  <label className="block text-xs mb-1" style={{ color: THEME.textDim }}>
+                    Observações
+                  </label>
                   <textarea
                     value={ann.note}
                     onChange={(e) => onUpdateAnnotation(ann.id, { note: e.target.value })}
-                    className="w-full rounded border border-white/10 bg-[#0f141a] text-sm p-2"
                     rows={3}
-                    placeholder="Adicione detalhes…"
+                    className="w-full text-sm px-2 py-2 rounded-md"
+                    style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.text }}
+                    placeholder="Adicione detalhes..."
                   />
                 </div>
 
-                <div className="col-span-2 flex items-center justify-between mt-2">
+                <div className="col-span-2 flex items-center justify-between mt-1">
                   <button
                     onClick={() => onSelectAnnotation(ann.id)}
-                    className="px-4 py-2 rounded bg-[#26405d] hover:brightness-110 text-sm"
+                    className="px-3 py-2 rounded-md text-sm font-medium"
+                    style={{ background: THEME.action1, color: "#062a27" }}
                   >
                     Localizar
                   </button>
                   <button
                     onClick={() => onDeleteAnnotation(ann.id)}
-                    className="px-4 py-2 rounded bg-[#b85236] hover:brightness-110 text-sm"
+                    className="px-3 py-2 rounded-md text-sm font-medium"
+                    style={{ background: "#2a0b0b", border: `1px solid ${THEME.border}`, color: "#ff9a9a" }}
                   >
                     Excluir
                   </button>
@@ -1080,49 +979,34 @@ export default function App3DAnnotations() {
               </div>
             </div>
           ))}
-          {filteredAnnotations.length === 0 && (
-            <div className="text-sm text-white/70 bg-[#0b0f14] border border-dashed border-white/10 rounded-xl p-6 text-center">
-              Nenhuma anotação. Ative <b>Anotar</b> e toque no modelo para marcar.
+
+          {annotations.length === 0 && (
+            <div
+              className="text-center text-sm px-4 py-6 rounded-md"
+              style={{ background: "#0b1622", border: `1px solid ${THEME.border}`, color: THEME.textDim }}
+            >
+              Nenhuma anotação. Ative <span style={{ color: THEME.text }}>Anotar</span> e toque no modelo.
             </div>
           )}
         </div>
 
         {/* Legenda */}
-        <div className="p-4 border-t border-white/10 bg-[#0d131a]">
-          <div className="text-xs text-white/70 mb-2">Legenda de status</div>
+        <div className="px-4 py-3" style={{ borderTop: `1px solid ${THEME.border}`, background: "#0b1622" }}>
+          <div className="text-xs mb-2" style={{ color: THEME.textDim }}>
+            Legenda de status
+          </div>
           <div className="grid grid-cols-2 gap-2">
             {DEFAULT_STATUSES.map((s) => (
-              <div key={s} className="flex items-center gap-2 text-sm">
-                <div
-                  className="w-3 h-3 rounded-full"
-                  style={{
-                    backgroundColor: `#${STATUS_COLORS[s].toString(16).padStart(6, "0")}`,
-                    border: STATUS_COLORS[s] === 0xffffff ? "1px solid #ccc" : "none",
-                  }}
-                />
-                <span className="text-white/80">{s}</span>
+              <div key={s} className="flex items-center gap-2">
+                <div className="w-3 h-3 rounded-full" style={{ background: "#" + STATUS_COLORS[s].toString(16).padStart(6, "0") }} />
+                <span className="text-xs" style={{ color: THEME.text }}>
+                  {s}
+                </span>
               </div>
             ))}
           </div>
         </div>
       </div>
-
-      {/* Importante: tutorial opcional */}
-      {showTutorial && (
-        <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-40 p-6">
-          <div className="bg-[#0f141a] border border-white/10 rounded-2xl p-6 max-w-lg">
-            <h2 className="text-xl font-bold mb-3">Bem-vindo!</h2>
-            <ul className="list-disc pl-6 space-y-2 text-white/80">
-              <li>Use <b>Carregar Modelo</b> e selecione .obj (e .mtl) se tiver.</li>
-              <li>Ative <b>Anotar</b> e toque no modelo para criar uma anotação.</li>
-              <li>O nome exibido da peça vira o <b>type</b> do seu JSON quando encontrar o <b>upld</b>.</li>
-            </ul>
-            <button onClick={() => setShowTutorial(false)} className="mt-4 px-4 py-2 rounded bg-[#26405d]">
-              Entendi
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
