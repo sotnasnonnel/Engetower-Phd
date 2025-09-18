@@ -2,12 +2,16 @@
   "name": "engetower-phd",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
-    "test": "react-scripts test --watchAll=false",
+    "test": "react-scripts test",
     "eject": "react-scripts eject"
-  },
+  }
+},
 "dependencies": {
   "react": "^18.2.0",
   "react-dom": "^18.2.0",
