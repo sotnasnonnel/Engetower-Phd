@@ -15,6 +15,11 @@
     "web-vitals": "^2.1.4",
     "xlsx": "^0.18.5"
   },
+
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
@@ -46,3 +51,5 @@
     "tailwindcss": "^3.4.17"
   }
 }
+
+
