@@ -13,7 +13,10 @@
     "@testing-library/user-event": "^13.5.0",
     "web-vitals": "^2.1.4"
   },
-  "engines": { "node": "18.x", "npm": "10.x" },
+  "engines": {
+  "node": "22.x",
+  "npm": "10.x"
+},
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
